@@ -3858,6 +3858,7 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
         tip_type,
         code: Some(code.to_owned()),
         params: None,
+        supersedes_key: None,
     })
 }
 
@@ -4176,6 +4177,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             level,
             message,
             localized,
+            supersedes_key,
         } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
@@ -4194,6 +4196,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 tip_type,
                 code,
                 params,
+                supersedes_key,
             })]
         }
         // Agent-generated session title (claude generate_session_title, spec
@@ -5063,6 +5066,7 @@ mod translate_tests {
                     level,
                     message: "set effort: rejected by agent".into(),
                     localized: None,
+                    supersedes_key: None,
                 },
                 "conv-1",
                 false,

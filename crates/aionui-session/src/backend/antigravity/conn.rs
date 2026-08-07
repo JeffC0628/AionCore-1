@@ -419,6 +419,7 @@ impl AntigravitySessionBackend {
                         level,
                         message,
                         localized: Some(localized),
+                        supersedes_key: None,
                     },
                 );
             }

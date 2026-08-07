@@ -1057,6 +1057,7 @@ impl ClaudeSessionBackend {
                     level,
                     message,
                     localized: Some(localized),
+                    supersedes_key: None,
                 },
             });
         });
@@ -2261,6 +2262,7 @@ fn sniff_set_config_reject(
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
             localized: None,
+            supersedes_key: None,
         },
     });
 }

@@ -135,6 +135,7 @@ impl Translator {
                             if failed == 1 { "" } else { "s" }
                         ),
                         localized: Some(LocalizedText::new(CODE_STEPS_FAILED).with("count", failed)),
+                        supersedes_key: None,
                     });
                 }
                 out.push(SessionEvent::TurnResult {

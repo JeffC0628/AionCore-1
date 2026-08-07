@@ -1216,6 +1216,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("ACP_EMPTY_TURN_NEEDS_AUTH".into()),
             params: Some(serde_json::json!({ "hint": "Run `kilo auth login` in the terminal" })),
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1251,6 +1252,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("ACP_EMPTY_TURN".into()),
             params: None,
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1289,6 +1291,7 @@ mod tests {
             tip_type: TipType::Info,
             code: Some("ACP_EMPTY_TURN_TOKEN_LIMIT".into()),
             params: None,
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1812,6 +1815,7 @@ mod tests {
             tip_type: TipType::Warning,
             code: None,
             params: None,
+            supersedes_key: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData {
@@ -1910,6 +1914,7 @@ mod tests {
                 tip_type: aionui_ai_agent::protocol::events::TipType::Warning,
                 code: Some("ACP_EMPTY_TURN".into()),
                 params: None,
+                supersedes_key: None,
             },
         ))
         .unwrap();

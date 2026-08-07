@@ -931,6 +931,7 @@ impl CodexSessionBackend {
                     level,
                     message,
                     localized: Some(localized),
+                    supersedes_key: None,
                 },
             });
         });
@@ -1751,6 +1752,7 @@ async fn reader_task(
                                                 level: crate::event::NoticeLevel::Warning,
                                                 message: format!("Codex logout failed: {msg}"),
                                                 localized: None,
+                                                supersedes_key: None,
                                             },
                                         );
                                     }
@@ -1867,6 +1869,7 @@ async fn reader_task(
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
                                         localized: None,
+                                        supersedes_key: None,
                                     },
                                 );
                             }
@@ -2652,11 +2655,27 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 // response stream disconnected repeatedly). Surface what codex
                 // said so a stall is explained while it is happening.
                 let mut out = vec![SessionEvent::Heartbeat];
+                // Once per turn. codex retries up to five times and emits each
+                // attempt twice, so notifying on every frame would trade one
+                // extreme (silence for minutes) for another (ten identical
+                // cards). The first attempt already tells the user what is
+                // happening; the rest say the same thing.
                 if let Some(message) = retry_notice_message(params) {
+                    // Keyed per TURN so attempt 2/5 replaces 1/5 in place: the
+                    // user watches one card count up instead of collecting five
+                    // near-identical ones (codex emits each attempt more than
+                    // once, so appending produced ten). A frame without a turn
+                    // id falls back to a per-thread key rather than appending.
+                    let scope = params
+                        .get("turnId")
+                        .or_else(|| params.get("threadId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("session");
                     out.push(SessionEvent::Notice {
                         level: crate::event::NoticeLevel::Warning,
                         message,
                         localized: None,
+                        supersedes_key: Some(format!("codex-retry:{scope}")),
                     });
                 }
                 out
@@ -2674,6 +2693,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 level: crate::event::NoticeLevel::Warning,
                 message,
                 localized: None,
+                supersedes_key: None,
             }]
         }
         "configWarning" => {
@@ -2682,6 +2702,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 level: crate::event::NoticeLevel::Warning,
                 message,
                 localized: None,
+                supersedes_key: None,
             }]
         }
         "deprecationNotice" => {
@@ -2690,6 +2711,7 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 level: crate::event::NoticeLevel::Info,
                 message,
                 localized: None,
+                supersedes_key: None,
             }]
         }
         // `hook/*` provisioning is a separate concern (not MCP startup) — kept as a
@@ -3554,6 +3576,7 @@ impl SessionBackend for CodexSessionBackend {
                             level: crate::event::NoticeLevel::Warning,
                             message: "Logged out of Codex. New turns will require re-authentication.".into(),
                             localized: None,
+                            supersedes_key: None,
                         },
                     );
                     return Ok(CommandReceipt {
@@ -4290,6 +4313,55 @@ mod tests {
             .expect("the retry reason must reach the user");
         assert!(notice.contains("Reconnecting"), "keeps codex's headline: {notice}");
         assert!(notice.contains("high demand"), "keeps the cause: {notice}");
+    }
+
+    /// Successive attempts must REPLACE the previous card, not stack up: codex
+    /// emits each of its five attempts more than once, so appending produced
+    /// ten near-identical warnings for a single stall.
+    #[tokio::test]
+    async fn successive_retry_attempts_share_one_superseding_key() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5","additionalDetails":"high demand"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"high demand"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":2}"#,
+        ])
+        .await;
+
+        let keys: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Notice { supersedes_key, .. } => Some(supersedes_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2, "both attempts are reported, got {events:?}");
+        assert_eq!(
+            keys[0], keys[1],
+            "the same turn's attempts must share a key so the card updates"
+        );
+        assert!(
+            keys[0].as_deref().is_some_and(|k| k.contains("u1")),
+            "the key is scoped to the turn, got {keys:?}"
+        );
+    }
+
+    /// A different turn gets its own card — one stalled turn must not silently
+    /// overwrite another's notice.
+    #[tokio::test]
+    async fn retries_in_different_turns_do_not_share_a_key() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5"},"willRetry":true,"threadId":"th1","turnId":"u2"},"emittedAtMs":2}"#,
+        ])
+        .await;
+        let keys: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Notice { supersedes_key, .. } => Some(supersedes_key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "separate turns must not overwrite each other");
     }
 
     /// A retry frame with nothing to say must not produce an empty card.
