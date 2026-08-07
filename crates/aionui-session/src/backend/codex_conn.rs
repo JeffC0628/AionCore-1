@@ -1384,6 +1384,9 @@ async fn reader_task(
         return;
     };
 
+    // Running totals for the retry card, kept per turn (see RetryNoticeTracker).
+    let mut retry_notices = RetryNoticeTracker::default();
+
     // R8: has the CURRENT turn already produced its single TurnResult? Set by the
     // authoritative `turn/completed`; the trailing `status→idle` is then absorbed.
     // Reset on `turn/started` so the NEXT turn can terminate once.
@@ -1631,6 +1634,7 @@ async fn reader_task(
                             continue;
                         }
                         for ev in map_notification(m, params) {
+                            let ev = retry_notices.apply(ev, cur, aionui_common::now_ms());
                             emit(&event_tx, &session_id, cur, ev);
                         }
                     }
@@ -2655,27 +2659,20 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 // response stream disconnected repeatedly). Surface what codex
                 // said so a stall is explained while it is happening.
                 let mut out = vec![SessionEvent::Heartbeat];
-                // Once per turn. codex retries up to five times and emits each
-                // attempt twice, so notifying on every frame would trade one
-                // extreme (silence for minutes) for another (ten identical
-                // cards). The first attempt already tells the user what is
-                // happening; the rest say the same thing.
                 if let Some(message) = retry_notice_message(params) {
-                    // Keyed per TURN so attempt 2/5 replaces 1/5 in place: the
-                    // user watches one card count up instead of collecting five
-                    // near-identical ones (codex emits each attempt more than
-                    // once, so appending produced ten). A frame without a turn
-                    // id falls back to a per-thread key rather than appending.
-                    let scope = params
-                        .get("turnId")
-                        .or_else(|| params.get("threadId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("session");
+                    // One card for the whole stall: attempt 2/5 replaces 1/5 in
+                    // place, so the user watches it count up instead of
+                    // collecting five near-identical cards (codex emits each
+                    // attempt more than once, so appending produced ten).
+                    // Deliberately NOT keyed on codex's own `turnId`: a single
+                    // prompt can make codex retry in several rounds, each with a
+                    // fresh turnId, and that showed up as two cards both reading
+                    // "5/5". The reader scopes this key to OUR turn instead.
                     out.push(SessionEvent::Notice {
                         level: crate::event::NoticeLevel::Warning,
                         message,
                         localized: None,
-                        supersedes_key: Some(format!("codex-retry:{scope}")),
+                        supersedes_key: Some(RETRY_NOTICE_KEY.to_string()),
                     });
                 }
                 out
@@ -2739,6 +2736,96 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
 /// `error.message` is the headline ("Reconnecting... 1/5"); `additionalDetails`
 /// carries the cause ("We're currently experiencing high demand"), which is the
 /// part that tells the user this is not their fault and not a hung app.
+/// Merge key for the retry card, scoped to our turn by [`RetryNoticeTracker`]
+/// before it leaves the reader.
+const RETRY_NOTICE_KEY: &str = "codex-retry";
+
+/// i18n code for the annotated retry card.
+const CODE_CODEX_RETRYING: &str = "CODEX_RETRYING";
+
+/// Turns a stream of retry frames into the one card the user watches.
+///
+/// Two things the CLI's own line cannot say. First, scope: the key decides
+/// which card a notice replaces, and session-wide would let a stall in turn 7
+/// rewrite a card sitting next to turn 1, while codex's own `turnId` is too
+/// narrow — one prompt can make codex retry in several rounds, and keying on
+/// its id showed the user two cards both reading "5/5", which looks like a
+/// duplicate. Our turn generation is the scope that matches what the user did:
+/// one prompt, one card.
+///
+/// Second, totals. codex restarts its counter at "1/5" for every round, so the
+/// text alone understates a long stall. The tracker carries the running attempt
+/// count and how long the prompt has been waiting, which is what makes the card
+/// readable when the counter resets.
+#[derive(Default)]
+struct RetryNoticeTracker {
+    turn_gen: u64,
+    attempts: u32,
+    first_attempt_ms: i64,
+}
+
+impl RetryNoticeTracker {
+    /// Scope a superseding notice to `turn_gen`, annotating a retry with this
+    /// turn's running totals. Anything else passes through untouched.
+    fn apply(&mut self, event: SessionEvent, turn_gen: u64, now_ms: i64) -> SessionEvent {
+        let SessionEvent::Notice {
+            level,
+            message,
+            localized,
+            supersedes_key: Some(key),
+        } = event
+        else {
+            return event;
+        };
+
+        let scoped = format!("{key}:turn-{turn_gen}");
+        if key != RETRY_NOTICE_KEY {
+            return SessionEvent::Notice {
+                level,
+                message,
+                localized,
+                supersedes_key: Some(scoped),
+            };
+        }
+
+        if self.turn_gen != turn_gen || self.attempts == 0 {
+            self.turn_gen = turn_gen;
+            self.attempts = 0;
+            self.first_attempt_ms = now_ms;
+        }
+        self.attempts += 1;
+
+        let elapsed = humanize_ms(now_ms.saturating_sub(self.first_attempt_ms));
+        let mut localized = crate::event::LocalizedText::new(CODE_CODEX_RETRYING);
+        localized.params.insert("detail".into(), Value::String(message.clone()));
+        localized
+            .params
+            .insert("attempts".into(), Value::from(u64::from(self.attempts)));
+        localized
+            .params
+            .insert("elapsed".into(), Value::String(elapsed.clone()));
+
+        SessionEvent::Notice {
+            level,
+            // The English text stays usable on its own: it is what a client
+            // without the i18n code renders, and what lands in the log.
+            message: format!("{message} (attempt {}, {elapsed} so far)", self.attempts),
+            localized: Some(localized),
+            supersedes_key: Some(scoped),
+        }
+    }
+}
+
+/// Compact, locale-neutral duration: `45s`, `7m41s`, `1h02m`.
+fn humanize_ms(ms: i64) -> String {
+    let total = (ms.max(0) / 1000) as u64;
+    match (total / 3600, (total % 3600) / 60, total % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s:02}s"),
+        (h, m, _) => format!("{h}h{m:02}m"),
+    }
+}
+
 fn retry_notice_message(params: &Value) -> Option<String> {
     let error = params.get("error")?;
     let headline = error.get("message").and_then(Value::as_str).unwrap_or("").trim();
@@ -4339,17 +4426,19 @@ mod tests {
             "the same turn's attempts must share a key so the card updates"
         );
         assert!(
-            keys[0].as_deref().is_some_and(|k| k.contains("u1")),
-            "the key is scoped to the turn, got {keys:?}"
+            keys[0].as_deref().is_some_and(|k| k.starts_with("codex-retry:turn-")),
+            "the key is scoped to our turn, got {keys:?}"
         );
     }
 
-    /// A different turn gets its own card — one stalled turn must not silently
-    /// overwrite another's notice.
+    /// One prompt can make codex retry in more than one round, each round
+    /// carrying a fresh `turnId`. Live 0.147.0 did exactly that and produced two
+    /// cards both ending at "5/5", which reads as a bug. Rounds within one of
+    /// OUR turns are one stall, so they share one card.
     #[tokio::test]
-    async fn retries_in_different_turns_do_not_share_a_key() {
+    async fn retry_rounds_within_one_prompt_share_one_card() {
         let events = drive_codex(&[
-            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 5/5"},"willRetry":true,"threadId":"th1","turnId":"u1"},"emittedAtMs":1}"#,
             r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5"},"willRetry":true,"threadId":"th1","turnId":"u2"},"emittedAtMs":2}"#,
         ])
         .await;
@@ -4361,7 +4450,117 @@ mod tests {
             })
             .collect();
         assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1], "separate turns must not overwrite each other");
+        assert_eq!(
+            keys[0], keys[1],
+            "a second retry round is the same stall, not a new card"
+        );
+    }
+
+    /// The turn generation is what separates cards: a stall in a later turn must
+    /// not rewrite a card sitting next to an earlier one.
+    #[test]
+    fn notices_from_different_turns_get_different_keys() {
+        let notice = || SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Warning,
+            message: "Reconnecting... 1/5".into(),
+            localized: None,
+            supersedes_key: Some(RETRY_NOTICE_KEY.to_string()),
+        };
+        let key_of = |event: SessionEvent| match event {
+            SessionEvent::Notice { supersedes_key, .. } => supersedes_key,
+            _ => None,
+        };
+
+        let mut tracker = RetryNoticeTracker::default();
+        assert_ne!(
+            key_of(tracker.apply(notice(), 1, 0)),
+            key_of(tracker.apply(notice(), 2, 0))
+        );
+    }
+
+    /// codex restarts its own counter at "1/5" for every retry round, so the
+    /// card has to carry totals the CLI does not: how many attempts this prompt
+    /// has cost and how long the user has been waiting.
+    #[test]
+    fn a_retry_card_reports_the_running_totals() {
+        let mut tracker = RetryNoticeTracker::default();
+        let retry = |text: &str| SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Warning,
+            message: text.into(),
+            localized: None,
+            supersedes_key: Some(RETRY_NOTICE_KEY.to_string()),
+        };
+
+        let _ = tracker.apply(retry("Reconnecting... 1/5"), 1, 0);
+        // Second round: codex is back at 1/5, the user is 90s in on attempt 6.
+        let sixth = tracker.apply(retry("Reconnecting... 1/5"), 1, 90_000);
+        for _ in 0..4 {
+            let _ = tracker.apply(retry("Reconnecting... 2/5"), 1, 90_000);
+        }
+
+        let SessionEvent::Notice { message, localized, .. } = sixth else {
+            panic!("expected a notice");
+        };
+        assert!(message.contains("attempt 2"), "got {message}");
+        assert!(message.contains("1m30s"), "got {message}");
+
+        let localized = localized.expect("the card is localizable");
+        assert_eq!(localized.code, CODE_CODEX_RETRYING);
+        assert_eq!(localized.params["detail"], "Reconnecting... 1/5");
+        assert_eq!(localized.params["attempts"], 2);
+        assert_eq!(localized.params["elapsed"], "1m30s");
+    }
+
+    /// The totals belong to one prompt: a later turn starts its own count and
+    /// its own clock, not a running tally for the whole session.
+    #[test]
+    fn a_new_turn_restarts_the_totals() {
+        let mut tracker = RetryNoticeTracker::default();
+        let retry = || SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Warning,
+            message: "Reconnecting... 1/5".into(),
+            localized: None,
+            supersedes_key: Some(RETRY_NOTICE_KEY.to_string()),
+        };
+
+        let _ = tracker.apply(retry(), 1, 0);
+        let _ = tracker.apply(retry(), 1, 5_000);
+        let next_turn = tracker.apply(retry(), 2, 600_000);
+
+        let SessionEvent::Notice { localized, .. } = next_turn else {
+            panic!("expected a notice");
+        };
+        let localized = localized.expect("the card is localizable");
+        assert_eq!(localized.params["attempts"], 1);
+        assert_eq!(localized.params["elapsed"], "0s");
+    }
+
+    #[test]
+    fn durations_read_compactly() {
+        assert_eq!(humanize_ms(0), "0s");
+        assert_eq!(humanize_ms(45_400), "45s");
+        assert_eq!(humanize_ms(461_000), "7m41s");
+        assert_eq!(humanize_ms(3_720_000), "1h02m");
+        assert_eq!(humanize_ms(-5), "0s");
+    }
+
+    /// A notice with no key is untouched — scoping must not turn a plain notice
+    /// into one that silently replaces something.
+    #[test]
+    fn a_notice_without_a_key_stays_without_one() {
+        let plain = SessionEvent::Notice {
+            level: crate::event::NoticeLevel::Info,
+            message: "advisory".into(),
+            localized: None,
+            supersedes_key: None,
+        };
+        assert!(matches!(
+            RetryNoticeTracker::default().apply(plain, 3, 0),
+            SessionEvent::Notice {
+                supersedes_key: None,
+                ..
+            }
+        ));
     }
 
     /// A retry frame with nothing to say must not produce an empty card.
