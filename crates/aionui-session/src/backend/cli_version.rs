@@ -16,6 +16,12 @@
 //! `antigravity::version` keeps its own module only for the agy-specific
 //! notice copy.
 
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
+
+use aionui_common::CommandSpec;
+use aionui_process::Spawner;
+
 use crate::event::{LocalizedText, NoticeLevel};
 
 /// The release a backend's wire contracts were verified against.
@@ -170,6 +176,94 @@ pub fn version_drift(cli: &str, reported: &str) -> Option<VersionDrift> {
     })
 }
 
+/// Budget for the one-shot `--version` probe. Generous: a cold Node CLI can
+/// take seconds, and a timeout only costs us the drift claim, never the
+/// session.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn read_first_line(stdout: aionui_process::BoxedStdout) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+/// Read `<cli> --version`, or `None` when it cannot be determined.
+///
+/// Best-effort: a version we cannot read must not stop a session, it only
+/// means no drift claim can be made. `stdin` is dropped immediately because
+/// agy waits on it; the others do not care.
+pub async fn probe_cli_version(
+    spawner: &Arc<dyn Spawner>,
+    program: &std::path::Path,
+    owner_tag: &str,
+) -> Option<String> {
+    let spec = CommandSpec {
+        command: program.to_path_buf(),
+        args: vec!["--version".to_owned()],
+        env: Vec::new(),
+        cwd: None,
+    };
+    let proc = spawner.spawn(spec, &[], owner_tag).await.ok()?;
+    let (stdin, stdout) = proc.take_stdio().await?;
+    drop(stdin);
+    tokio::time::timeout(PROBE_TIMEOUT, read_first_line(stdout))
+        .await
+        .ok()?
+}
+
+/// Sessions that have already carried the version notice, keyed by
+/// `(cli, session_id)`.
+///
+/// Deduped per SESSION, not per process. The notice is a card in a
+/// conversation's own history, so a process-wide latch meant only the first
+/// conversation after a restart ever showed it — a user who hit odd behaviour
+/// in their fifth conversation had no way to see that their CLI had drifted.
+/// Keyed by CLI too so a session that somehow drives two backends reports each.
+static REPORTED: LazyLock<Mutex<HashSet<(String, String)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Whether this (cli, session) pair has already reported, marking it reported.
+pub fn already_reported(cli: &str, session_id: &str) -> bool {
+    !REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((cli.to_owned(), session_id.to_owned()))
+}
+
+/// Probe `<cli> --version` and return the drift notice to emit, if any.
+///
+/// Returns `None` when this session already reported, when the CLI is not
+/// version-gated, when the probe failed, or when the install matches — i.e.
+/// the caller emits whatever comes back and needs no further conditions.
+pub async fn session_drift_notice(
+    spawner: &Arc<dyn Spawner>,
+    cli: &str,
+    program: &std::path::Path,
+    session_id: &str,
+) -> Option<(NoticeLevel, String, LocalizedText)> {
+    let Some(verified) = verified_version(cli) else {
+        tracing::debug!(cli = %cli, "version check skipped: CLI is not version-gated");
+        return None;
+    };
+    if already_reported(cli, session_id) {
+        tracing::debug!(session_id = %session_id, cli = %cli, "version check skipped: already reported for this session");
+        return None;
+    }
+    let Some(reported) = probe_cli_version(spawner, program, session_id).await else {
+        tracing::warn!(session_id = %session_id, cli = %cli, program = %program.display(), "version probe produced no output");
+        return None;
+    };
+    tracing::info!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version detected");
+    let notice = drift_notice(cli, &reported, verified)?;
+    tracing::warn!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version drift");
+    Some(notice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +340,36 @@ mod tests {
         for raw in ["", "error: not signed in", "???"] {
             assert_eq!(version_drift("agy", raw), None, "raw={raw:?}");
         }
+    }
+
+    /// The drift notice is a card in a conversation's own history, so every
+    /// conversation has to be able to carry it. A process-wide latch meant only
+    /// the first conversation after a restart ever showed it.
+    #[test]
+    fn the_notice_is_deduped_per_session_not_per_process() {
+        let a = format!("conv-a-{}", std::process::id());
+        let b = format!("conv-b-{}", std::process::id());
+
+        assert!(!already_reported("claude", &a), "a session's first check must report");
+        assert!(already_reported("claude", &a), "the same session must not repeat it");
+        assert!(
+            !already_reported("claude", &b),
+            "a different conversation must still report"
+        );
+        assert!(
+            !already_reported("codex", &a),
+            "a different CLI in the same session reports on its own"
+        );
+    }
+
+    #[test]
+    fn local_codex_output_is_classified_as_newer() {
+        // Real `codex --version` output on this machine (2026-08-07).
+        assert_eq!(parse_version("codex-cli 0.147.0"), Some(vec![0, 147, 0]));
+        let (level, _, localized) =
+            drift_notice("codex", "codex-cli 0.147.0", VERIFIED_CODEX_VERSION).expect("0.147.0 drifts from 0.144.6");
+        assert_eq!(level, NoticeLevel::Info);
+        assert_eq!(localized.code, CODE_CLI_VERSION_NEWER);
     }
 
     #[test]

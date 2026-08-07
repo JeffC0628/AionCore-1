@@ -27,11 +27,11 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
 use super::mcp_config::write_mcp_config;
-use super::models::{probe_models, probe_version};
+use super::models::probe_models;
 use super::skills::scan_skill_commands;
 use super::translate::Translator;
 use super::wire::parse_line;
-use crate::backend::cli_version::{VERIFIED_AGY_VERSION, drift_notice};
+use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
     PermissionDecision, SessionEnvelope, SessionSpec,
@@ -82,25 +82,6 @@ fn store_models(models: &[ModelInfo]) {
     if let Ok(mut guard) = model_cache().write() {
         *guard = models.to_vec();
     }
-}
-
-/// Sessions that have already carried the version notice.
-///
-/// Deduped per SESSION, not per process. The notice is a card in a
-/// conversation's own history, so a process-wide latch meant only the first
-/// conversation after a restart ever showed it — a user who hit odd behaviour
-/// in their fifth conversation had no way to see that their CLI had drifted,
-/// because the one report had been spent hours earlier somewhere else. Once per
-/// conversation keeps the original intent (no repeats inside a session) while
-/// letting every conversation carry the context it needs.
-static VERSION_REPORTED_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
-fn version_already_reported(session_id: &str) -> bool {
-    !VERSION_REPORTED_SESSIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(session_id.to_owned())
 }
 
 /// How long a permission card may stay unanswered before we answer `deny` for
@@ -418,9 +399,6 @@ impl AntigravitySessionBackend {
     /// Reported once per process: the answer cannot change while agy's binary
     /// stays put, and repeating it on every session would be noise.
     fn spawn_version_check(self: &Arc<Self>) {
-        if version_already_reported(&self.session_id) {
-            return;
-        }
         let spawner = Arc::clone(&self.spawner);
         let session_id = self.session_id.clone();
         let program = self
@@ -430,14 +408,10 @@ impl AntigravitySessionBackend {
             .unwrap_or_else(|| std::path::PathBuf::from("agy"));
         let weak = self.weak_self.get().cloned();
         tokio::spawn(async move {
-            let Some(reported) = probe_version(&spawner, &program, &session_id).await else {
+            let Some((level, message, localized)) = session_drift_notice(&spawner, "agy", &program, &session_id).await
+            else {
                 return;
             };
-            tracing::info!(session_id = %session_id, version = %reported, "antigravity: agy version detected");
-            let Some((level, message, localized)) = drift_notice("agy", &reported, VERIFIED_AGY_VERSION) else {
-                return;
-            };
-            tracing::warn!(session_id = %session_id, version = %reported, "antigravity: agy version drift");
             if let Some(backend) = weak.and_then(|w| w.upgrade()) {
                 backend.emit(
                     backend.turn_gen.load(Ordering::SeqCst),
@@ -993,22 +967,6 @@ mod tests {
     use crate::backend::types::CommandMeta;
     use crate::testing::FakeSpawner;
     use serde_json::json;
-
-    /// The drift notice is a card in a conversation's own history, so every
-    /// conversation has to be able to carry it. A process-wide latch meant only
-    /// the first conversation after a restart ever showed it.
-    #[test]
-    fn the_version_notice_is_deduped_per_session_not_per_process() {
-        let a = format!("conv-a-{}", std::process::id());
-        let b = format!("conv-b-{}", std::process::id());
-
-        assert!(!version_already_reported(&a), "a session's first check must report");
-        assert!(version_already_reported(&a), "the same session must not repeat it");
-        assert!(
-            !version_already_reported(&b),
-            "a different conversation must still get the notice"
-        );
-    }
 
     fn config(cwd: &str) -> SessionConfig {
         SessionConfig {

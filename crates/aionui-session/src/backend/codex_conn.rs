@@ -101,6 +101,11 @@ impl BackendConnection for CodexConnection {
             config: config.clone(),
         };
         let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
+        // Report a codex whose version differs from the release AionUi verified.
+        // codex runs from the user's own install (nothing is bundled), the same
+        // situation agy has always been in. Placed here rather than at the two
+        // return sites so the reconcile path cannot skip it.
+        backend.spawn_version_check();
         // Seed the current model (M1): the backend tracks it from the start so the
         // model selector's current value and a subsequent SetModel are consistent.
         // OPTIMISTIC seed: the model is not actually bound at thread/start
@@ -894,6 +899,43 @@ fn idle_check_interval_ms(idle_ttl_ms: Option<i64>) -> u64 {
 }
 
 impl CodexSessionBackend {
+    /// Tell the user once per conversation when the installed codex is not the
+    /// release AionUi verified.
+    ///
+    /// Fire-and-forget: the probe spawns `codex --version` and a failure only
+    /// costs the drift claim, never the session.
+    fn spawn_version_check(&self) {
+        let Some(spawner) = self.wake.spawner.clone() else {
+            tracing::debug!(session_id = %self.session_id, "codex version check skipped: no spawner on the wake recipe");
+            return;
+        };
+        let session_id = self.session_id.clone();
+        let program = self
+            .wake
+            .config
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("codex"));
+        let event_tx = self.event_tx.clone();
+        let turn_gen = Arc::clone(&self.turn_gen);
+        tokio::spawn(async move {
+            let Some((level, message, localized)) =
+                crate::backend::cli_version::session_drift_notice(&spawner, "codex", &program, &session_id).await
+            else {
+                return;
+            };
+            let _ = event_tx.send(SessionEnvelope {
+                session_id: session_id.clone(),
+                turn_gen: turn_gen.load(std::sync::atomic::Ordering::SeqCst),
+                event: SessionEvent::Notice {
+                    level,
+                    message,
+                    localized: Some(localized),
+                },
+            });
+        });
+    }
+
     /// Test-support seam: build over an injected `AgentIo` replaying a codex
     /// JSON-RPC fixture WITHOUT spawning a real app-server — proves the
     /// parse/reverse-RPC/dispatch contract end-to-end.
@@ -2603,7 +2645,21 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
         // The `vec![]` is a defensive fallthrough only.
         "error" => {
             if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
-                vec![SessionEvent::Heartbeat]
+                // A retry keeps the turn alive (Heartbeat), but staying silent
+                // made an upstream stall indistinguishable from a hung app:
+                // codex says "Reconnecting... 1/5" with a reason, and the user
+                // saw only a spinner that never resolved (live 0.147.0, whose
+                // response stream disconnected repeatedly). Surface what codex
+                // said so a stall is explained while it is happening.
+                let mut out = vec![SessionEvent::Heartbeat];
+                if let Some(message) = retry_notice_message(params) {
+                    out.push(SessionEvent::Notice {
+                        level: crate::event::NoticeLevel::Warning,
+                        message,
+                        localized: None,
+                    });
+                }
+                out
             } else {
                 vec![]
             }
@@ -2655,6 +2711,28 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
 /// `configWarning` params object: `{summary, details?, ...}`. Joins summary +
 /// details (when present) so the user sees the actionable guidance, not just the
 /// headline. Falls back to `message` then empty string.
+/// The user-facing text for a RETRYING codex error, or `None` when the frame
+/// carries nothing worth showing.
+///
+/// `error.message` is the headline ("Reconnecting... 1/5"); `additionalDetails`
+/// carries the cause ("We're currently experiencing high demand"), which is the
+/// part that tells the user this is not their fault and not a hung app.
+fn retry_notice_message(params: &Value) -> Option<String> {
+    let error = params.get("error")?;
+    let headline = error.get("message").and_then(Value::as_str).unwrap_or("").trim();
+    let details = error
+        .get("additionalDetails")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match (headline.is_empty(), details.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some(format!("{headline} — {details}")),
+        (false, true) => Some(headline.to_owned()),
+        (true, false) => Some(details.to_owned()),
+    }
+}
+
 fn notice_message(params: &Value) -> String {
     let summary = params
         .get("summary")
@@ -4184,6 +4262,47 @@ mod tests {
     use crate::event::PermissionKind;
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;
+
+    /// A retrying error must reach the user, not just tick the heartbeat.
+    ///
+    /// Frame captured live from codex 0.147.0, whose response stream kept
+    /// disconnecting: the turn stayed "in progress" forever with no assistant
+    /// output, and the only clue — codex's own "Reconnecting… / high demand"
+    /// message — was swallowed, so a stalled upstream was indistinguishable
+    /// from a hung app.
+    #[tokio::test]
+    async fn a_retrying_error_surfaces_the_reason_alongside_the_heartbeat() {
+        let events = drive_codex(&[
+            r#"{"method":"error","params":{"error":{"message":"Reconnecting... 1/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"We're currently experiencing high demand, which may cause temporary errors."},"willRetry":true,"threadId":"t1","turnId":"u1"},"emittedAtMs":1}"#,
+        ])
+        .await;
+
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::Heartbeat)),
+            "a retry is still a liveness signal, got {events:?}"
+        );
+        let notice = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("the retry reason must reach the user");
+        assert!(notice.contains("Reconnecting"), "keeps codex's headline: {notice}");
+        assert!(notice.contains("high demand"), "keeps the cause: {notice}");
+    }
+
+    /// A retry frame with nothing to say must not produce an empty card.
+    #[tokio::test]
+    async fn a_retry_without_text_only_heartbeats() {
+        let events =
+            drive_codex(&[r#"{"method":"error","params":{"error":{},"willRetry":true},"emittedAtMs":1}"#]).await;
+        assert!(events.iter().any(|e| matches!(e, SessionEvent::Heartbeat)));
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "an empty error must not render a blank notice, got {events:?}"
+        );
+    }
 
     /// Build a FakeAgentIo replaying codex JSON-RPC lines, then collect the
     /// SessionEvents the backend surfaces (excluding the EOF Detached).
