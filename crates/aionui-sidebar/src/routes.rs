@@ -10,6 +10,7 @@
 //! - `GET /api/sidebar/items` — one more window of a single group (`scope` +
 //!   keyset `cursor`).
 //! - `PUT`/`DELETE /api/order/{scene}/{item_type}/{item_id}` — pin / unpin.
+//! - `POST /api/order/{scene}/move` — reposition a pinned item (drag-drop).
 //!
 //! Handlers only parse the request and shape the response; all classification
 //! and ordering lives in [`SidebarService`]. [`SidebarError`] maps to `ApiError`
@@ -18,7 +19,9 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, ArchiveDeleteResult, RemoveProjectResult, SidebarItemsResponse, SidebarResponse};
+use aionui_api_types::{
+    ApiResponse, ArchiveDeleteResult, MoveOrderRequest, RemoveProjectResult, SidebarItemsResponse, SidebarResponse,
+};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::ArchiveScope;
@@ -42,6 +45,7 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
     Router::new()
         .route("/api/sidebar", get(get_sidebar))
         .route("/api/sidebar/items", get(get_items))
+        .route("/api/order/{scene}/move", post(move_order))
         .route(
             "/api/order/{scene}/{item_type}/{item_id}",
             put(put_order).delete(delete_order),
@@ -120,6 +124,26 @@ async fn delete_order(
     state
         .service
         .unpin(&user.id, &scene, &item_type, &item_id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `POST /api/order/{scene}/move` — reposition a pinned item by drag-drop.
+///
+/// Body is [`MoveOrderRequest`] (`moved` + optional `after` anchor; `after` =
+/// `null` moves to the top). The 4-segment path does not collide with the
+/// 5-segment pin/unpin route. Stale-window anchors map to 404 (`moved` gone) /
+/// 400 (`after` gone) so the frontend refetches the pinned group.
+async fn move_order(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(scene): Path<String>,
+    Json(body): Json<MoveOrderRequest>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .move_order(&user.id, &scene, &body)
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(())))

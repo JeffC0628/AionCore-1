@@ -84,4 +84,4 @@ pub use sqlite_user::SqliteUserRepository;
 pub use sqlite_user_order::SqliteUserOrderStore;
 pub use team::{ActivityCursor, ITeamRepository, PageDirection};
 pub use user::IUserRepository;
-pub use user_order::{IUserOrderStore, OrderItemRef, PinOutcome, PinnedCursor};
+pub use user_order::{IUserOrderStore, MoveOutcome, OrderItemRef, PinOutcome, PinnedCursor};

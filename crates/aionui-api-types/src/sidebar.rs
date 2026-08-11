@@ -145,6 +145,29 @@ pub enum RemoveProjectItemKind {
     Team,
 }
 
+/// A `(item_type, item_id)` reference in an ordering request body.
+///
+/// `item_type` is the raw TEXT enum value (`"conversation"` / `"team"`); the
+/// service parses it and returns a 400 on an unknown value, mirroring the
+/// pin/unpin path parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderItemRefDto {
+    pub item_type: String,
+    pub item_id: String,
+}
+
+/// `POST /api/order/{scene}/move` body: drag-drop placement.
+///
+/// The frontend sends only anchors — never `order_key` numbers (BR-26). `after`
+/// = `null` moves `moved` to the top of the scene; otherwise `moved` is placed
+/// directly after `after`. The server computes the key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveOrderRequest {
+    pub moved: OrderItemRefDto,
+    #[serde(default)]
+    pub after: Option<OrderItemRefDto>,
+}
+
 /// Aggregated team row for the sidebar.
 ///
 /// Membership grouping is already expressed by the group the row sits in, so

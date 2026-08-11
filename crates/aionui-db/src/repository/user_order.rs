@@ -39,6 +39,18 @@ pub enum PinOutcome {
     AlreadyPinned,
 }
 
+/// Result of a [`IUserOrderStore::move_item`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOutcome {
+    /// `moved` was repositioned (its `order_key` was recomputed).
+    Moved,
+    /// `moved` has no row in the scene — a stale frontend window (→ 404).
+    MovedNotFound,
+    /// The `after` anchor has no row in the scene — a stale frontend window
+    /// (→ 400); the client should refetch the pinned group.
+    AfterNotFound,
+}
+
 /// Access boundary for the `user_order` table.
 ///
 /// The store owns SQL and transactions; the `aionui-sidebar` service holds an
@@ -60,6 +72,22 @@ pub trait IUserOrderStore: Send + Sync {
     /// Unpin `item` in `scene`: delete the row. Returns `true` if a row was
     /// removed, `false` if it was not pinned (idempotent no-op).
     async fn unpin(&self, user_id: &str, scene: OrderScene, item: &OrderItemRef) -> Result<bool, DbError>;
+
+    /// Reposition `moved` within `scene` (drag-drop). `after = None` moves it to
+    /// the top; otherwise it lands directly after `after`. The `order_key` is
+    /// computed server-side (midpoint of the neighbours, whole-scene rebalance
+    /// when the gap is exhausted) — callers never pass a key (BR-26). The whole
+    /// read-neighbours → compute → write runs in one `BEGIN IMMEDIATE` write
+    /// transaction so concurrent moves cannot interleave (R1-S6). Returns
+    /// [`MoveOutcome::MovedNotFound`] / [`MoveOutcome::AfterNotFound`] when an
+    /// anchor is absent (stale window), leaving the table unchanged.
+    async fn move_item(
+        &self,
+        user_id: &str,
+        scene: OrderScene,
+        moved: &OrderItemRef,
+        after: Option<&OrderItemRef>,
+    ) -> Result<MoveOutcome, DbError>;
 
     /// One keyset page of a scene's rows, ordered by
     /// `(order_key, item_type, item_id)` ascending. `after = None` starts at the

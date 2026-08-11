@@ -18,14 +18,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use aionui_api_types::{
-    ArchiveDeleteResult, ConversationResponse, RemoveProjectItem, RemoveProjectItemKind, RemoveProjectResult,
-    SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope, SidebarTeamItem,
+    ArchiveDeleteResult, ConversationResponse, MoveOrderRequest, OrderItemRefDto, RemoveProjectItem,
+    RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse,
+    SidebarScope, SidebarTeamItem,
 };
 use aionui_common::now_ms;
 use aionui_conversation::{is_temp_session_workspace, row_to_response_with_extra};
 use aionui_db::models::ConversationRow;
 use aionui_db::{
-    ArchiveScope, ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, OrderScene, PinnedCursor,
+    ArchiveScope, ISidebarStore, IUserOrderStore, MoveOutcome, OrderItemRef, OrderItemType, OrderScene, PinnedCursor,
     SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
 };
 use aionui_project::canonical;
@@ -143,6 +144,39 @@ impl SidebarService {
         let item = OrderItemRef::new(item_type, id.to_owned());
         self.user_order.unpin(user_id, OrderScene::Pinned, &item).await?;
         Ok(())
+    }
+
+    /// Reposition a pinned item by drag-drop (`POST /api/order/{scene}/move`).
+    /// `after = None` moves it to the top; otherwise it lands right after
+    /// `after`. The store computes the key server-side (BR-26).
+    ///
+    /// Bad-path mapping (all 400/404, never a silent no-op):
+    /// - unknown `scene` / `item_type` → 400 (parse).
+    /// - `moved == after` (self-anchor) → 400 (would be a no-op with an
+    ///   ambiguous target; reject so the frontend refetches rather than trust a
+    ///   stale drag).
+    /// - `moved` not pinned → 404 (stale window; the row it dragged is gone).
+    /// - `after` not pinned → 400 (stale window; anchor gone — client refetches).
+    pub async fn move_order(&self, user_id: &str, scene: &str, req: &MoveOrderRequest) -> Result<(), SidebarError> {
+        let scene = parse_scene(scene)?;
+        let moved = parse_item_ref(&req.moved)?;
+        let after = req.after.as_ref().map(parse_item_ref).transpose()?;
+
+        if after.as_ref() == Some(&moved) {
+            return Err(SidebarError::BadRequest(
+                "moved and after refer to the same item".into(),
+            ));
+        }
+
+        match self
+            .user_order
+            .move_item(user_id, scene, &moved, after.as_ref())
+            .await?
+        {
+            MoveOutcome::Moved => Ok(()),
+            MoveOutcome::MovedNotFound => Err(SidebarError::ScopeGone),
+            MoveOutcome::AfterNotFound => Err(SidebarError::BadRequest("after anchor is not pinned".into())),
+        }
     }
 
     // -- Remove project (BR-19 / D13 "所见即所删") ---------------------------
@@ -1189,6 +1223,12 @@ fn parse_scene(scene: &str) -> Result<OrderScene, SidebarError> {
 
 fn parse_item_type(item_type: &str) -> Result<OrderItemType, SidebarError> {
     OrderItemType::parse(item_type).ok_or_else(|| SidebarError::BadRequest(format!("unknown item type: {item_type}")))
+}
+
+/// Parse an `OrderItemRefDto` body field into a validated `OrderItemRef`; an
+/// unknown `item_type` is a 400 (mirroring the pin/unpin path params).
+fn parse_item_ref(dto: &OrderItemRefDto) -> Result<OrderItemRef, SidebarError> {
+    Ok(OrderItemRef::new(parse_item_type(&dto.item_type)?, dto.item_id.clone()))
 }
 
 fn to_pinned_cursor(cursor: Cursor) -> Result<PinnedCursor, SidebarError> {

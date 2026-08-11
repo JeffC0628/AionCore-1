@@ -1,7 +1,7 @@
 use super::{PIN_GAP, SqliteUserOrderStore};
 use crate::init_database_memory;
 use crate::models::{OrderItemType, OrderScene};
-use crate::repository::user_order::{IUserOrderStore, OrderItemRef, PinOutcome, PinnedCursor};
+use crate::repository::user_order::{IUserOrderStore, MoveOutcome, OrderItemRef, PinOutcome, PinnedCursor};
 
 const USER: &str = "user-1";
 const OTHER_USER: &str = "user-2";
@@ -294,4 +294,223 @@ async fn concurrent_pins_serialize_into_distinct_rows() {
     let rows = store.list_pinned(USER, OrderScene::Pinned, None, 10).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_ne!(rows[0].order_key, rows[1].order_key, "keys must not collide");
+}
+
+// -- move_item -----------------------------------------------------------------
+
+/// Force one row to a specific `order_key`, so a test can seed a degenerate
+/// layout (e.g. an exhausted neighbour gap) that the public write path never
+/// produces on its own.
+async fn set_key(db: &crate::Database, item: &OrderItemRef, order_key: i64) {
+    sqlx::query(
+        "UPDATE user_order SET order_key = ? WHERE user_id = ? AND scene = ? AND item_type = ? AND item_id = ?",
+    )
+    .bind(order_key)
+    .bind(USER)
+    .bind(OrderScene::Pinned.as_str())
+    .bind(item.item_type.as_str())
+    .bind(&item.item_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+async fn ids(store: &SqliteUserOrderStore) -> Vec<String> {
+    store
+        .list_pinned(USER, OrderScene::Pinned, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.item_id)
+        .collect()
+}
+
+#[tokio::test]
+async fn move_to_top_places_below_current_min() {
+    let (store, _db) = store().await;
+    // Pin c1,c2,c3 → keys 1000, 0, -1000 → order [c3, c2, c1].
+    for id in ["c1", "c2", "c3"] {
+        store.pin(USER, OrderScene::Pinned, &conv(id)).await.unwrap();
+    }
+
+    // Move the bottom row (c1) to the top.
+    let outcome = store
+        .move_item(USER, OrderScene::Pinned, &conv("c1"), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome, MoveOutcome::Moved);
+
+    assert_eq!(ids(&store).await, vec!["c1", "c3", "c2"]);
+    let rows = store.list_pinned(USER, OrderScene::Pinned, None, 10).await.unwrap();
+    // min was -1000, so the new top is -2000, strictly below every other row.
+    assert_eq!(rows[0].order_key, -2000);
+}
+
+#[tokio::test]
+async fn move_after_anchor_lands_at_midpoint() {
+    let (store, _db) = store().await;
+    for id in ["c1", "c2", "c3"] {
+        store.pin(USER, OrderScene::Pinned, &conv(id)).await.unwrap();
+    }
+    // order [c3(-1000), c2(0), c1(1000)]. Move c3 to directly after c2.
+    store
+        .move_item(USER, OrderScene::Pinned, &conv("c3"), Some(&conv("c2")))
+        .await
+        .unwrap();
+
+    // Between c2(0) and c1(1000) → 500.
+    assert_eq!(ids(&store).await, vec!["c2", "c3", "c1"]);
+    let rows = store.list_pinned(USER, OrderScene::Pinned, None, 10).await.unwrap();
+    assert_eq!(rows[1].item_id, "c3");
+    assert_eq!(rows[1].order_key, 500);
+}
+
+#[tokio::test]
+async fn move_after_last_row_appends_one_gap_below() {
+    let (store, _db) = store().await;
+    for id in ["c1", "c2", "c3"] {
+        store.pin(USER, OrderScene::Pinned, &conv(id)).await.unwrap();
+    }
+    // order [c3(-1000), c2(0), c1(1000)]. Move c2 to after the last row (c1).
+    store
+        .move_item(USER, OrderScene::Pinned, &conv("c2"), Some(&conv("c1")))
+        .await
+        .unwrap();
+
+    assert_eq!(ids(&store).await, vec!["c3", "c1", "c2"]);
+    let rows = store.list_pinned(USER, OrderScene::Pinned, None, 10).await.unwrap();
+    // No successor of c1(1000) once c2 is excluded → key = 1000 + PIN_GAP.
+    assert_eq!(rows[2].item_id, "c2");
+    assert_eq!(rows[2].order_key, 1000 + PIN_GAP);
+}
+
+#[tokio::test]
+async fn move_after_immediate_predecessor_is_a_stable_noop_order() {
+    let (store, _db) = store().await;
+    for id in ["c1", "c2", "c3"] {
+        store.pin(USER, OrderScene::Pinned, &conv(id)).await.unwrap();
+    }
+    // order [c3, c2, c1]. Move c2 to after c3 (its current predecessor). The
+    // moved-self exclusion means c3's successor is c1, not c2 — so c2 stays
+    // between them and the visible order is unchanged.
+    store
+        .move_item(USER, OrderScene::Pinned, &conv("c2"), Some(&conv("c3")))
+        .await
+        .unwrap();
+    assert_eq!(ids(&store).await, vec!["c3", "c2", "c1"]);
+}
+
+#[tokio::test]
+async fn move_missing_item_reports_not_found() {
+    let (store, _db) = store().await;
+    store.pin(USER, OrderScene::Pinned, &conv("c1")).await.unwrap();
+
+    let outcome = store
+        .move_item(USER, OrderScene::Pinned, &conv("ghost"), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome, MoveOutcome::MovedNotFound);
+    // Table untouched.
+    assert_eq!(ids(&store).await, vec!["c1"]);
+}
+
+#[tokio::test]
+async fn move_after_missing_anchor_reports_not_found() {
+    let (store, _db) = store().await;
+    store.pin(USER, OrderScene::Pinned, &conv("c1")).await.unwrap();
+    store.pin(USER, OrderScene::Pinned, &conv("c2")).await.unwrap();
+
+    let outcome = store
+        .move_item(USER, OrderScene::Pinned, &conv("c1"), Some(&conv("ghost")))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MoveOutcome::AfterNotFound);
+    // order unchanged [c2, c1].
+    assert_eq!(ids(&store).await, vec!["c2", "c1"]);
+}
+
+#[tokio::test]
+async fn move_mixes_conversation_and_team_rows() {
+    let (store, _db) = store().await;
+    store.pin(USER, OrderScene::Pinned, &conv("c1")).await.unwrap();
+    store.pin(USER, OrderScene::Pinned, &team("t1")).await.unwrap();
+    // order [t1(0), c1(1000)]. Move t1 to after c1 → t1 goes to the bottom.
+    store
+        .move_item(USER, OrderScene::Pinned, &team("t1"), Some(&conv("c1")))
+        .await
+        .unwrap();
+    assert_eq!(ids(&store).await, vec!["c1", "t1"]);
+}
+
+#[tokio::test]
+async fn move_rebalances_when_neighbour_gap_is_exhausted() {
+    let (store, db) = store().await;
+    for id in ["a", "b", "m"] {
+        store.pin(USER, OrderScene::Pinned, &conv(id)).await.unwrap();
+    }
+    // Seed a degenerate layout: a(1000), b(1001) are adjacent (gap 1), m parked
+    // at the bottom. Moving m to after a cannot fit an integer midpoint, so the
+    // whole scene must rebalance first.
+    set_key(&db, &conv("a"), 1000).await;
+    set_key(&db, &conv("b"), 1001).await;
+    set_key(&db, &conv("m"), 5000).await;
+
+    store
+        .move_item(USER, OrderScene::Pinned, &conv("m"), Some(&conv("a")))
+        .await
+        .unwrap();
+
+    // Rebalance respaced [a, b, m] → 1000, 2000, 3000; then m lands between the
+    // fresh a(1000) and b(2000) at 1500.
+    assert_eq!(ids(&store).await, vec!["a", "m", "b"]);
+    let rows = store.list_pinned(USER, OrderScene::Pinned, None, 10).await.unwrap();
+    let by_id = |id: &str| rows.iter().find(|r| r.item_id == id).unwrap().order_key;
+    assert_eq!(by_id("a"), 1000);
+    assert_eq!(by_id("m"), 1500);
+    assert_eq!(by_id("b"), 2000, "b respaced away from its exhausted 1001 slot");
+    // Soft invariant: no two rows share a key after the move.
+    let mut keys: Vec<i64> = rows.iter().map(|r| r.order_key).collect();
+    keys.sort_unstable();
+    let unique = {
+        let mut k = keys.clone();
+        k.dedup();
+        k.len()
+    };
+    assert_eq!(unique, keys.len(), "keys must stay distinct after rebalance");
+}
+
+#[tokio::test]
+async fn concurrent_moves_serialize_without_key_collision() {
+    let (store, _db) = store().await;
+    for id in ["c1", "c2", "c3"] {
+        store.pin(USER, OrderScene::Pinned, &conv(id)).await.unwrap();
+    }
+    // Two concurrent moves on the same scene. BEGIN IMMEDIATE serializes the
+    // read-neighbours → compute → write, so neither reads a stale layout and
+    // both commit as Moved.
+    let a = {
+        let store = store.clone();
+        tokio::spawn(async move { store.move_item(USER, OrderScene::Pinned, &conv("c1"), None).await })
+    };
+    let b = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .move_item(USER, OrderScene::Pinned, &conv("c2"), Some(&conv("c3")))
+                .await
+        })
+    };
+    assert_eq!(a.await.unwrap().unwrap(), MoveOutcome::Moved);
+    assert_eq!(b.await.unwrap().unwrap(), MoveOutcome::Moved);
+
+    let rows = store.list_pinned(USER, OrderScene::Pinned, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 3, "no rows lost");
+    let mut keys: Vec<i64> = rows.iter().map(|r| r.order_key).collect();
+    keys.sort_unstable();
+    let deduped = {
+        let mut k = keys.clone();
+        k.dedup();
+        k.len()
+    };
+    assert_eq!(deduped, keys.len(), "concurrent moves must not collide keys");
 }
