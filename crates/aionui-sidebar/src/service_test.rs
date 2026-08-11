@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use aionui_api_types::{SidebarItem, SidebarScope};
+use aionui_api_types::{MoveOrderRequest, OrderItemRefDto, SidebarItem, SidebarScope};
 use aionui_db::{
     Database, ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, SqlitePool, SqliteSidebarStore,
     SqliteUserOrderStore, init_database_memory,
@@ -472,6 +472,74 @@ async fn pin_unpin_is_idempotent_and_validated() {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn move_order_validates_and_maps_stale_anchors() {
+    let fx = fixture().await;
+    let req = |moved: &str, after: Option<&str>| MoveOrderRequest {
+        moved: OrderItemRefDto {
+            item_type: "conversation".into(),
+            item_id: moved.into(),
+        },
+        after: after.map(|id| OrderItemRefDto {
+            item_type: "conversation".into(),
+            item_id: id.into(),
+        }),
+    };
+
+    // Unknown scene / item_type -> 400.
+    assert!(matches!(
+        fx.service.move_order(USER, "bogus", &req("c1", None)).await,
+        Err(SidebarError::BadRequest(_))
+    ));
+    let bad_type = MoveOrderRequest {
+        moved: OrderItemRefDto {
+            item_type: "bogus".into(),
+            item_id: "c1".into(),
+        },
+        after: None,
+    };
+    assert!(matches!(
+        fx.service.move_order(USER, "pinned", &bad_type).await,
+        Err(SidebarError::BadRequest(_))
+    ));
+
+    // Self-anchor (moved == after) -> 400, never an ambiguous no-op.
+    assert!(matches!(
+        fx.service.move_order(USER, "pinned", &req("c1", Some("c1"))).await,
+        Err(SidebarError::BadRequest(_))
+    ));
+
+    // moved not pinned -> 404 (stale window).
+    assert!(matches!(
+        fx.service.move_order(USER, "pinned", &req("ghost", None)).await,
+        Err(SidebarError::ScopeGone)
+    ));
+
+    // after not pinned -> 400 (stale anchor; client refetches).
+    fx.service.pin(USER, "pinned", "conversation", "c1").await.unwrap();
+    assert!(matches!(
+        fx.service.move_order(USER, "pinned", &req("c1", Some("ghost"))).await,
+        Err(SidebarError::BadRequest(_))
+    ));
+
+    // Happy path: reorder two pins.
+    fx.service.pin(USER, "pinned", "conversation", "c2").await.unwrap();
+    // order [c2, c1] (newest on top). Move c2 to after c1 -> [c1, c2].
+    fx.service
+        .move_order(USER, "pinned", &req("c2", Some("c1")))
+        .await
+        .unwrap();
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM user_order WHERE user_id = ? AND scene = 'pinned' \
+         ORDER BY order_key ASC, item_type ASC, item_id ASC",
+    )
+    .bind(USER)
+    .fetch_all(fx.pool())
+    .await
+    .unwrap();
+    assert_eq!(ids, vec!["c1", "c2"]);
 }
 
 #[tokio::test]
