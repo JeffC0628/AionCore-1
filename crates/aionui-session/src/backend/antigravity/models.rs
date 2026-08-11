@@ -23,14 +23,33 @@ fn looks_like_model_id(line: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
 }
 
+/// Split a catalog line into `(id, label)`.
+///
+/// agy 1.1.12 prints `id<TAB>Human Label`; earlier releases printed a bare id
+/// (the 2026-07-31 capture in the tests below). Both are accepted: the id is
+/// whatever precedes the first tab, and a line with no tab is all id — so the
+/// parser does not break again the next time the label column moves.
+///
+/// The id still has to look like an id. That is what keeps agy's prose — the
+/// signed-out notice above all — from being offered as a model, and it is the
+/// check the whole-line version was accidentally applying to the label too,
+/// which is why every 1.1.12 line was dropped and the picker opened empty.
+fn split_catalog_line(line: &str) -> Option<(&str, &str)> {
+    let (id, label) = match line.split_once('\t') {
+        Some((id, label)) => (id.trim(), label.trim()),
+        None => (line, line),
+    };
+    looks_like_model_id(id).then_some((id, if label.is_empty() { id } else { label }))
+}
+
 pub(crate) fn parse_agy_models(stdout: &str) -> Vec<ModelInfo> {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|l| looks_like_model_id(l))
-        .map(|id| ModelInfo {
+        .filter_map(split_catalog_line)
+        .map(|(id, label)| ModelInfo {
             id: id.to_owned(),
-            name: id.to_owned(),
+            name: label.to_owned(),
             description: None,
             // Deliberately empty — see the module docs.
             reasoning_efforts: Vec::new(),
@@ -99,6 +118,37 @@ async fn read_to_end(stdout: aionui_process::BoxedStdout) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// agy 1.1.12 prints `id<TAB>label`, not a bare id — captured live
+    /// 2026-08-12 from `agy models` (1.1.12), whose changelog entry only
+    /// mentioned moving the spinner off stdout.
+    ///
+    /// Every one of these lines fails `looks_like_model_id` (tab and spaces are
+    /// not in its allowed set), so the whole catalog is dropped and the model
+    /// picker opens empty.
+    #[test]
+    fn parses_the_tab_separated_catalog_agy_prints_today() {
+        let out = "gemini-3.6-flash-high\tGemini 3.6 Flash (High)\n\
+                   gemini-3.5-flash-low\tGemini 3.5 Flash (Low)\n\
+                   claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n\
+                   gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
+        let models = parse_agy_models(out);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "gemini-3.6-flash-high",
+                "gemini-3.5-flash-low",
+                "claude-sonnet-4-6",
+                "gpt-oss-120b-medium",
+            ],
+            "the id is the first field, not the whole line"
+        );
+        assert_eq!(
+            models.first().map(|m| m.name.as_str()),
+            Some("Gemini 3.6 Flash (High)"),
+            "the label agy now supplies is what the picker should show"
+        );
+    }
 
     #[test]
     fn parses_one_id_per_line() {
