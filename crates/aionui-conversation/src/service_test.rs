@@ -8455,6 +8455,7 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
 // project row's `kind` (`standard`/`temp`) is the authoritative signal and a
 // mislabeled one can be promoted `temp -> standard`.
 
+#[cfg(unix)]
 #[test]
 fn is_temp_session_workspace_classifies_every_layout() {
     // (workspace, expected_temp, why). One row per historical layout plus the
@@ -8531,6 +8532,14 @@ fn is_temp_session_workspace_classifies_every_layout() {
         ),
     ];
 
+    assert_temp_layout_matrix(cases);
+}
+
+/// Shared assertion loop for the temp-layout matrix. `is_temp_session_workspace`
+/// leans on `Path::file_name`, whose separator handling is platform-specific, so
+/// the matrix is run twice: with POSIX literals on unix and with drive-letter +
+/// backslash paths on Windows.
+fn assert_temp_layout_matrix(cases: &[(&str, bool, &str)]) {
     for (workspace, expected, why) in cases {
         assert_eq!(
             is_temp_session_workspace(Path::new(workspace)),
@@ -8538,4 +8547,85 @@ fn is_temp_session_workspace_classifies_every_layout() {
             "{workspace} should classify temp={expected} ({why})",
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn is_temp_session_workspace_classifies_every_layout_windows() {
+    // Windows-native shapes (drive letter + backslashes) of every row in the
+    // unix twin. POSIX literals happen to parse on Windows too, so they would
+    // not actually exercise backslash `file_name` extraction — these do.
+    let cases: &[(&str, bool, &str)] = &[
+        // --- positive: every auto-generated layout the backend has emitted ---
+        (
+            r"C:\srv\aionui-data\conversations\users\u1\2026\08\11\acp-temp-conv-1",
+            true,
+            "current per-user dated layout under the live root",
+        ),
+        (
+            r"D:\old-data\aionui\conversations\users\u1\2025\01\02\acp-temp-conv-1",
+            true,
+            "same layout but a migrated (older) root prefix must not defeat it",
+        ),
+        (
+            r"C:\srv\aionui-data\conversations\users\u1\2026\08\11\team-temp-team_1",
+            true,
+            "team temp leaf",
+        ),
+        (
+            r"C:\old\conversations\claude-temp-xyz",
+            true,
+            "early conversations/ layout: bare -temp- leaf, no dated dirs",
+        ),
+        (
+            r"C:\old\conversations\2025\01\02\acp-temp-conv-1",
+            true,
+            "date-partitioned conversations/ layout",
+        ),
+        (
+            r"C:\Users\me\AppData\Roaming\aionui\codex-temp-1776940954621",
+            true,
+            "pre-conversations/ bare leaf at the data-dir root (digit-timestamp id)",
+        ),
+        (
+            r"C:\srv\aionui-data\tmp\acp-temp-1699999999",
+            true,
+            "original <data_dir>/tmp/ container layout",
+        ),
+        (
+            r"D:\old-data\aionui\tmp\claude-temp-1650000000",
+            true,
+            "tmp/ container under a migrated root",
+        ),
+        (
+            r"C:\Users\me\AppData\Local\Temp\codex-temp-1699999999",
+            true,
+            "earliest layout: leaf under the OS temp dir, no app container at all",
+        ),
+        // --- negative: no -temp- leaf marker ---
+        (
+            r"C:\Users\me\conversations\myproj",
+            false,
+            "user dir merely under a conversations/ ancestor, no -temp- leaf",
+        ),
+        (r"C:\Users\me\work\proj", false, "plain project path, no marker"),
+        (
+            r"C:\srv\aionui-data\conversations",
+            false,
+            "the container dir itself, no leaf marker",
+        ),
+        (
+            r"C:\Users\me\tmp\scratch",
+            false,
+            "plain scratch dir under tmp/, no -temp- leaf marker",
+        ),
+        // --- accepted false positive (see is_temp_session_workspace doc) ---
+        (
+            r"C:\Users\me\work\my-temp-notes",
+            true,
+            "user project whose own leaf contains -temp-; project.kind overrides this",
+        ),
+    ];
+
+    assert_temp_layout_matrix(cases);
 }
