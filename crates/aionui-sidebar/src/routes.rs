@@ -18,12 +18,13 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, RemoveProjectResult, SidebarItemsResponse, SidebarResponse};
+use aionui_api_types::{ApiResponse, ArchiveDeleteResult, RemoveProjectResult, SidebarItemsResponse, SidebarResponse};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::ArchiveScope;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 
 use crate::service::SidebarService;
@@ -46,6 +47,11 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
             put(put_order).delete(delete_order),
         )
         .route("/api/sidebar/project/{project_id}", delete(delete_project))
+        .route("/api/sidebar/conversation/{id}/archive", post(archive_conversation))
+        .route("/api/sidebar/conversation/{id}/unarchive", post(unarchive_conversation))
+        .route("/api/sidebar/team/{id}/archive", post(archive_team))
+        .route("/api/sidebar/team/{id}/unarchive", post(unarchive_team))
+        .route("/api/sidebar/archived", delete(delete_archived))
         .with_state(state)
 }
 
@@ -64,7 +70,7 @@ async fn get_sidebar(
 
     let response = state
         .service
-        .first_screen(&user.id, limit, &win)
+        .first_screen(&user.id, limit, &win, params.archive_scope())
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(response)))
@@ -85,7 +91,7 @@ async fn get_items(
 
     let response = state
         .service
-        .items(&user.id, &scope, cursor.as_deref(), limit)
+        .items(&user.id, &scope, cursor.as_deref(), limit, params.archive_scope())
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(response)))
@@ -142,6 +148,76 @@ async fn delete_project(
     Ok(Json(ApiResponse::ok(result)))
 }
 
+/// `DELETE /api/sidebar/archived` — empty the archive: hard-delete every archived
+/// team (members cascade) and every independent archived conversation.
+async fn delete_archived(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ArchiveDeleteResult>>, ApiError> {
+    let result = state
+        .service
+        .delete_all_archived(&user.id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+/// `POST /api/sidebar/conversation/{id}/archive` — move a conversation into the
+/// archive slice and unpin it (D6). Unknown / foreign id → 404.
+async fn archive_conversation(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .archive_conversation(&user.id, &id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `POST /api/sidebar/conversation/{id}/unarchive` — restore a conversation to
+/// the active sidebar. Unknown / foreign id → 404.
+async fn unarchive_conversation(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .unarchive_conversation(&user.id, &id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `POST /api/sidebar/team/{id}/archive` — archive a team (its member
+/// conversations cascade with it) and unpin it (D6). Unknown / foreign id → 404.
+async fn archive_team(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.archive_team(&user.id, &id).await.map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `POST /api/sidebar/team/{id}/unarchive` — restore a team and its members to
+/// the active sidebar. Unknown / foreign id → 404.
+async fn unarchive_team(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .unarchive_team(&user.id, &id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
 /// Parsed query string: percent-decoded `(key, value)` pairs. `axum::Query`
 /// (serde_urlencoded) collapses duplicate keys, so `win` — which repeats — is
 /// parsed from the raw query instead.
@@ -179,6 +255,17 @@ impl QueryParams {
         match self.single(key) {
             None => false,
             Some(v) => v.is_empty() || v == "true" || v == "1",
+        }
+    }
+
+    /// Which archive slice to read. `?archived` (flag) selects the archive page;
+    /// its absence keeps the default active sidebar. The archived slice reuses the
+    /// same grouped read model — only the underlying `archived_at` predicate flips.
+    fn archive_scope(&self) -> ArchiveScope {
+        if self.flag("archived") {
+            ArchiveScope::Archived
+        } else {
+            ArchiveScope::Active
         }
     }
 

@@ -115,6 +115,19 @@ pub struct RemoveProjectResult {
     pub items: Vec<RemoveProjectItem>,
 }
 
+/// Result of `DELETE /api/sidebar/archived` — the batch "empty archive" action.
+///
+/// Reports how many visible units were removed. Team-member conversations are not
+/// counted separately: they are folded into their team and removed by the team
+/// cascade, matching [`RemoveProjectResult`]'s accounting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveDeleteResult {
+    /// Archived teams removed (each cascades its member conversations).
+    pub teams_deleted: i64,
+    /// Independent archived conversations removed (team members excluded).
+    pub conversations_deleted: i64,
+}
+
 /// One named unit in a [`RemoveProjectResult`] preview.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveProjectItem {

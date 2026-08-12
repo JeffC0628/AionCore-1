@@ -58,7 +58,7 @@ pub use project::IProjectStore;
 pub use provider::IProviderRepository;
 pub use remote_agent::IRemoteAgentRepository;
 pub use settings::ISettingsRepository;
-pub use sidebar::{ISidebarStore, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin};
+pub use sidebar::{ArchiveScope, ISidebarStore, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin};
 pub use skill::ISkillRepository;
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;

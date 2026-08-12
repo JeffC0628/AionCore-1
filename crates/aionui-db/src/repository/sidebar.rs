@@ -6,15 +6,31 @@
 //! and hydrates only the windowed items via a single `IN (...)` batch. See
 //! `api-contract-sidebar.md` §5.1 (single read transaction, no N+1).
 //!
-//! Base exclusion (conversations): `archived_at IS NULL` + the shared
-//! health-check keep-fragment (BR-23, `$.is_health_check` in `extra`). The
-//! marker is legacy and has no writer anywhere in the workspace today, so the
-//! predicate is a defensive no-op — but it is applied identically by the thin
-//! listing and by hydration so the口径 cannot drift if a writer ever appears.
-//! Teams have no probe rows, so their thin listing filters `archived_at` only.
+//! Base filter (conversations): the [`ArchiveScope`] `archived_at` predicate +
+//! the shared health-check keep-fragment (BR-23, `$.is_health_check` in
+//! `extra`). The marker is legacy and has no writer anywhere in the workspace
+//! today, so the predicate is a defensive no-op — but it is applied identically
+//! by the thin listing and by hydration so the口径 cannot drift if a writer ever
+//! appears. Teams have no probe rows, so their thin listing filters
+//! `archived_at` only.
 
 use crate::error::DbError;
 use crate::models::ConversationRow;
+
+/// Which archive slice the sidebar read model draws from.
+///
+/// The active left panel and the archive settings page share one classification
+/// engine; this selects the `archived_at` predicate they diverge on — `IS NULL`
+/// for the everyday panel, `IS NOT NULL` for the archive page. Kept as a plain
+/// value type (no SQL) so it can cross the crate boundary; the concrete
+/// predicate lives with the SQLite store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveScope {
+    /// Non-archived rows (`archived_at IS NULL`) — the default sidebar.
+    Active,
+    /// Archived rows (`archived_at IS NOT NULL`) — the archive page.
+    Archived,
+}
 
 /// A conversation reduced to what sidebar classification needs.
 ///
@@ -80,11 +96,15 @@ pub struct SidebarProjectMeta {
 /// binding resolves to nothing and degrades to a dangling id (BR-24).
 #[async_trait::async_trait]
 pub trait ISidebarStore: Send + Sync {
-    /// All active (non-archived) conversations for a user, thin.
-    async fn list_active_conversations_thin(&self, user_id: &str) -> Result<Vec<SidebarConversationThin>, DbError>;
+    /// All conversations for a user in the given archive slice, thin.
+    async fn list_conversations_thin(
+        &self,
+        user_id: &str,
+        scope: ArchiveScope,
+    ) -> Result<Vec<SidebarConversationThin>, DbError>;
 
-    /// All active (non-archived) teams for a user, thin.
-    async fn list_active_teams_thin(&self, user_id: &str) -> Result<Vec<SidebarTeamThin>, DbError>;
+    /// All teams for a user in the given archive slice, thin.
+    async fn list_teams_thin(&self, user_id: &str, scope: ArchiveScope) -> Result<Vec<SidebarTeamThin>, DbError>;
 
     /// Every project owned by the user (standard *and* temp), each joined to its
     /// workspace folder identity. This single enumeration is the service's whole
@@ -96,7 +116,29 @@ pub trait ISidebarStore: Send + Sync {
     async fn list_user_projects(&self, user_id: &str) -> Result<Vec<SidebarProjectMeta>, DbError>;
 
     /// Full rows for the windowed conversation ids, for response hydration.
-    /// Filtered to the user and to non-archived rows (a race that archives a row
-    /// mid-request simply drops it from the window).
-    async fn hydrate_conversations(&self, user_id: &str, ids: &[String]) -> Result<Vec<ConversationRow>, DbError>;
+    /// Filtered to the user and to the same archive slice as the thin listing, so
+    /// a race that flips a row's archived state mid-request simply drops it from
+    /// the window rather than surfacing it in the wrong slice.
+    async fn hydrate_conversations(
+        &self,
+        user_id: &str,
+        ids: &[String],
+        scope: ArchiveScope,
+    ) -> Result<Vec<ConversationRow>, DbError>;
+
+    /// Set (`Some(now_ms)`) or clear (`None`) a conversation's `archived_at`,
+    /// user-scoped. Returns whether a matching row existed — `false` is the
+    /// caller's 404. The value is applied unconditionally (no `archived_at`
+    /// predicate), so the call is idempotent for the target slice and the returned
+    /// flag reflects row existence, not prior archive state.
+    async fn set_conversation_archived(&self, user_id: &str, id: &str, at: Option<i64>) -> Result<bool, DbError>;
+
+    /// Set (`Some(now_ms)`) or clear (`None`) a team's `archived_at`, **cascading
+    /// the same value to its member conversations** so the team and its folded
+    /// members always share one archive slice (the read model orphans members
+    /// whose team is not in their slice — see the sidebar service `aggregate_teams`
+    /// fold). Members are matched by the `team_id` / `teamId` marker in `extra`
+    /// (BR-22). Returns whether the team row existed; a missing team touches no
+    /// members and is the caller's 404.
+    async fn set_team_archived(&self, user_id: &str, id: &str, at: Option<i64>) -> Result<bool, DbError>;
 }

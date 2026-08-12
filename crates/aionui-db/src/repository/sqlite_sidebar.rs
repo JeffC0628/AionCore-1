@@ -2,7 +2,9 @@ use sqlx::{Row, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::ConversationRow;
-use crate::repository::sidebar::{ISidebarStore, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin};
+use crate::repository::sidebar::{
+    ArchiveScope, ISidebarStore, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
+};
 
 /// SQLite-backed implementation of [`ISidebarStore`].
 #[derive(Clone, Debug)]
@@ -24,6 +26,16 @@ impl SqliteSidebarStore {
 const HEALTH_CHECK_KEEP: &str =
     "(json_extract(extra, '$.is_health_check') IS NULL OR json_extract(extra, '$.is_health_check') NOT IN (1, 'true'))";
 
+/// The `archived_at` predicate for an [`ArchiveScope`]. A `&'static str` spliced
+/// into the query text (no bind), so both thin listing and hydration select the
+/// same slice from one source.
+fn archived_predicate(scope: ArchiveScope) -> &'static str {
+    match scope {
+        ArchiveScope::Active => "archived_at IS NULL",
+        ArchiveScope::Archived => "archived_at IS NOT NULL",
+    }
+}
+
 /// Fold a stored string into `None` when it is empty or whitespace-only.
 ///
 /// Applies uniformly to workspace paths (empty `extra.workspace` / `teams.workspace`
@@ -40,9 +52,14 @@ fn placeholders(count: usize) -> String {
 
 #[async_trait::async_trait]
 impl ISidebarStore for SqliteSidebarStore {
-    async fn list_active_conversations_thin(&self, user_id: &str) -> Result<Vec<SidebarConversationThin>, DbError> {
+    async fn list_conversations_thin(
+        &self,
+        user_id: &str,
+        scope: ArchiveScope,
+    ) -> Result<Vec<SidebarConversationThin>, DbError> {
         // Team-membership marker: canonical `team_id` first, camelCase `teamId`
         // fallback (BR-22 — production still writes camelCase).
+        let archived = archived_predicate(scope);
         let sql = format!(
             "SELECT id, \
                     NULLIF(project_id, '') AS project_id, \
@@ -50,7 +67,7 @@ impl ISidebarStore for SqliteSidebarStore {
                     COALESCE(NULLIF(json_extract(extra, '$.team_id'), ''), NULLIF(json_extract(extra, '$.teamId'), '')) AS team_id, \
                     updated_at, created_at \
              FROM conversations \
-             WHERE user_id = ? AND archived_at IS NULL AND {HEALTH_CHECK_KEEP}"
+             WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP}"
         );
         let rows = sqlx::query(&sql).bind(user_id).fetch_all(&self.pool).await?;
 
@@ -67,17 +84,16 @@ impl ISidebarStore for SqliteSidebarStore {
             .collect())
     }
 
-    async fn list_active_teams_thin(&self, user_id: &str) -> Result<Vec<SidebarTeamThin>, DbError> {
-        let rows = sqlx::query(
+    async fn list_teams_thin(&self, user_id: &str, scope: ArchiveScope) -> Result<Vec<SidebarTeamThin>, DbError> {
+        let archived = archived_predicate(scope);
+        let sql = format!(
             "SELECT id, name, \
                     NULLIF(project_id, '') AS project_id, \
                     workspace, updated_at, created_at \
              FROM teams \
-             WHERE user_id = ? AND archived_at IS NULL",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE user_id = ? AND {archived}"
+        );
+        let rows = sqlx::query(&sql).bind(user_id).fetch_all(&self.pool).await?;
 
         Ok(rows
             .into_iter()
@@ -113,13 +129,19 @@ impl ISidebarStore for SqliteSidebarStore {
         Ok(rows.into_iter().map(map_project_meta).collect())
     }
 
-    async fn hydrate_conversations(&self, user_id: &str, ids: &[String]) -> Result<Vec<ConversationRow>, DbError> {
+    async fn hydrate_conversations(
+        &self,
+        user_id: &str,
+        ids: &[String],
+        scope: ArchiveScope,
+    ) -> Result<Vec<ConversationRow>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        let archived = archived_predicate(scope);
         let sql = format!(
             "SELECT * FROM conversations \
-             WHERE user_id = ? AND archived_at IS NULL AND {HEALTH_CHECK_KEEP} AND id IN ({})",
+             WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP} AND id IN ({})",
             placeholders(ids.len())
         );
         let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
@@ -128,6 +150,44 @@ impl ISidebarStore for SqliteSidebarStore {
             query = query.bind(id);
         }
         Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    async fn set_conversation_archived(&self, user_id: &str, id: &str, at: Option<i64>) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE conversations SET archived_at = ? WHERE user_id = ? AND id = ?")
+            .bind(at)
+            .bind(user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_team_archived(&self, user_id: &str, id: &str, at: Option<i64>) -> Result<bool, DbError> {
+        // Flip the team first; existence drives the caller's 404. A missing team
+        // has no members to cascade to, so skip the member update entirely.
+        let team = sqlx::query("UPDATE teams SET archived_at = ? WHERE user_id = ? AND id = ?")
+            .bind(at)
+            .bind(user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if team.rows_affected() == 0 {
+            return Ok(false);
+        }
+        // Cascade the *same* `at` to member conversations, matched by the team
+        // marker in `extra` (canonical `team_id`, camelCase `teamId` fallback —
+        // BR-22), so the whole folded unit moves together.
+        sqlx::query(
+            "UPDATE conversations SET archived_at = ? \
+             WHERE user_id = ? \
+               AND COALESCE(NULLIF(json_extract(extra, '$.team_id'), ''), NULLIF(json_extract(extra, '$.teamId'), '')) = ?",
+        )
+        .bind(at)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
     }
 }
 
