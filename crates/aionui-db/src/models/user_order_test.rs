@@ -2,9 +2,8 @@ use super::{OrderItemType, OrderScene};
 
 #[test]
 fn order_scene_roundtrips_through_column_value() {
-    for scene in [OrderScene::Pinned] {
-        assert_eq!(OrderScene::parse(scene.as_str()), Some(scene));
-    }
+    let scene = OrderScene::Pinned;
+    assert_eq!(OrderScene::parse(scene.as_str()), Some(scene));
     assert_eq!(OrderScene::parse("unknown"), None);
 }
 
