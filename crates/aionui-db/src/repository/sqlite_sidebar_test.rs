@@ -1,6 +1,6 @@
 use super::SqliteSidebarStore;
 use crate::init_database_memory;
-use crate::repository::sidebar::ISidebarStore;
+use crate::repository::sidebar::{ArchiveScope, ISidebarStore};
 use sqlx::SqlitePool;
 
 const USER: &str = "user-1";
@@ -149,7 +149,7 @@ async fn thin_conversations_extract_fields_and_fold_blanks() {
     // No extra keys at all.
     insert_conv(pool, USER, "c3", None, "{}", 10, None).await;
 
-    let mut rows = store.list_active_conversations_thin(USER).await.unwrap();
+    let mut rows = store.list_conversations_thin(USER, ArchiveScope::Active).await.unwrap();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(rows.len(), 3);
 
@@ -177,9 +177,21 @@ async fn thin_conversations_exclude_archived_and_other_users() {
     insert_conv(pool, USER, "archived", None, "{}", 20, Some(999)).await;
     insert_conv(pool, OTHER_USER, "foreign", None, "{}", 30, None).await;
 
-    let rows = store.list_active_conversations_thin(USER).await.unwrap();
-    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    let active = store.list_conversations_thin(USER, ArchiveScope::Active).await.unwrap();
+    let ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, vec!["live"], "archived and cross-user rows excluded");
+
+    // The scope flip selects the complementary slice: same user, archived only.
+    let archived = store
+        .list_conversations_thin(USER, ArchiveScope::Archived)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = archived.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["archived"],
+        "archived scope selects only archived, still user-scoped"
+    );
 }
 
 #[tokio::test]
@@ -190,13 +202,18 @@ async fn thin_teams_fold_blank_workspace_and_exclude_archived() {
     insert_team(pool, USER, "t2", "", None, 50, None).await;
     insert_team(pool, USER, "t3", "/x", None, 10, Some(1)).await;
 
-    let mut rows = store.list_active_teams_thin(USER).await.unwrap();
+    let mut rows = store.list_teams_thin(USER, ArchiveScope::Active).await.unwrap();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, vec!["t1", "t2"], "archived team excluded");
     assert_eq!(rows[0].workspace.as_deref(), Some("/team/ws"));
     assert_eq!(rows[0].project_id.as_deref(), Some("proj-A"));
     assert_eq!(rows[1].workspace, None, "empty team workspace folds to None");
+
+    // Scope flip: only the archived team, still user-scoped.
+    let archived = store.list_teams_thin(USER, ArchiveScope::Archived).await.unwrap();
+    let ids: Vec<&str> = archived.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["t3"], "archived scope selects only archived team");
 }
 
 #[tokio::test]
@@ -277,8 +294,9 @@ async fn hydrate_conversations_is_scoped_and_batched() {
     insert_conv(pool, USER, "archived", None, "{}", 40, Some(1)).await;
     insert_conv(pool, OTHER_USER, "foreign", None, "{}", 30, None).await;
 
+    let ids_arg = ["c1".to_string(), "c2".into(), "archived".into(), "foreign".into()];
     let rows = store
-        .hydrate_conversations(USER, &["c1".into(), "c2".into(), "archived".into(), "foreign".into()])
+        .hydrate_conversations(USER, &ids_arg, ArchiveScope::Active)
         .await
         .unwrap();
     let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
@@ -286,6 +304,14 @@ async fn hydrate_conversations_is_scoped_and_batched() {
     assert_eq!(ids, vec!["c1", "c2"], "archived + cross-user dropped from window");
     let c1 = rows.iter().find(|r| r.id == "c1").unwrap();
     assert_eq!(c1.project_id.as_deref(), Some("proj-A"));
+
+    // Same id set under the archived scope hydrates only the archived row.
+    let rows = store
+        .hydrate_conversations(USER, &ids_arg, ArchiveScope::Archived)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["archived"], "archived scope hydrates only archived rows");
 }
 
 #[tokio::test]
@@ -295,5 +321,11 @@ async fn empty_inputs_short_circuit() {
         store.list_user_projects(USER).await.unwrap().is_empty(),
         "no projects => empty"
     );
-    assert!(store.hydrate_conversations(USER, &[]).await.unwrap().is_empty());
+    assert!(
+        store
+            .hydrate_conversations(USER, &[], ArchiveScope::Active)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

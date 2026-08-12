@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{SidebarItem, SidebarScope};
 use aionui_db::{
-    Database, ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, SqlitePool, SqliteSidebarStore,
-    SqliteUserOrderStore, init_database_memory,
+    ArchiveScope, Database, ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, SqlitePool,
+    SqliteSidebarStore, SqliteUserOrderStore, init_database_memory,
 };
 use aionui_project::canonical;
 use async_trait::async_trait;
@@ -101,6 +101,16 @@ async fn insert_conv_ws(pool: &SqlitePool, user: &str, id: &str, workspace: &str
 async fn insert_member(pool: &SqlitePool, user: &str, id: &str, team_id: &str, updated_at: i64) {
     let extra = serde_json::json!({ "teamId": team_id }).to_string();
     insert_conv(pool, user, id, None, &extra, updated_at).await;
+}
+
+/// Flip a conversation into the archived slice (`archived_at = at`).
+async fn archive_conv(pool: &SqlitePool, id: &str, at: i64) {
+    sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
+        .bind(at)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn insert_team(
@@ -255,7 +265,11 @@ async fn classifies_five_cases_for_conversations() {
     // case 5: unbound, temp-session workspace => chats.
     insert_conv_ws(pool, USER, "c5", &fx.temp_workspace("sess-a"), 60).await;
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
 
     // case 1 + case 3 land in the same standard-project group (path merge).
     assert_eq!(conv_ids(&find_project(&resp, "proj-std").items), vec!["c1", "c3"]);
@@ -292,7 +306,11 @@ async fn migrated_root_temp_workspace_still_classifies_to_chats() {
     let migrated = "/old-data/aionui/conversations/users/u1/2025/01/02/acp-temp-migrated";
     insert_conv_ws(pool, USER, "c-mig", migrated, 60).await;
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
 
     assert_eq!(conv_ids(&find_chats(&resp).items), vec!["c-mig"]);
     assert!(
@@ -316,7 +334,11 @@ async fn path_merge_does_not_write_the_db() {
     .await;
     insert_conv_ws(pool, USER, "c3", "/repo/std", 80).await;
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     assert_eq!(
         conv_ids(&find_project(&resp, "proj-std").items),
         vec!["c3"],
@@ -349,8 +371,72 @@ async fn dangling_project_id_falls_through_to_path() {
     let extra = serde_json::json!({ "workspace": "/repo/std" }).to_string();
     insert_conv(pool, USER, "ghost", Some("no-such-proj"), &extra, 80).await;
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     assert_eq!(conv_ids(&find_project(&resp, "proj-std").items), vec!["ghost"]);
+}
+
+// -- Archive scope: same engine, different slice (?archived) -----------------
+
+#[tokio::test]
+async fn archived_scope_reads_only_archived_without_pinned_or_spine() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    // A standard project spine that surfaces (possibly empty) in the active view;
+    // the archived slice must not carry it (no empty archived project groups).
+    insert_std_project(
+        pool,
+        USER,
+        "proj-std",
+        "Std",
+        &canon_of("/repo/std"),
+        &file_uri("/repo/std"),
+    )
+    .await;
+    // One active chat (pinned) and one archived chat, both plain (no workspace).
+    insert_conv(pool, USER, "active", None, "{}", 100).await;
+    insert_conv(pool, USER, "gone", None, "{}", 90).await;
+    archive_conv(pool, "gone", 999).await;
+    fx.service.pin(USER, "pinned", "conversation", "active").await.unwrap();
+
+    // Active view: pinned group present, the archived conv nowhere in sight.
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert!(find_pinned(&active).is_some(), "active view keeps the pinned group");
+    let active_ids: Vec<String> = active.groups.iter().flat_map(|g| conv_ids(&g.items)).collect();
+    assert!(
+        !active_ids.contains(&"gone".to_owned()),
+        "active view excludes the archived conversation"
+    );
+
+    // Archived view: only the archived chat, no pinned group, no standard spine.
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert_eq!(
+        conv_ids(&find_chats(&archived).items),
+        vec!["gone"],
+        "archived slice surfaces the archived chat"
+    );
+    assert!(
+        find_pinned(&archived).is_none(),
+        "archive view has no pinned group (pinned is active-only, D6)"
+    );
+    assert!(
+        !archived
+            .groups
+            .iter()
+            .any(|g| matches!(&g.scope, SidebarScope::Project { project_id, .. } if project_id == "proj-std")),
+        "archive view skips the standard-project spine"
+    );
 }
 
 // -- Teams: isomorphic classification + folding + orphan downgrade -----------
@@ -379,7 +465,11 @@ async fn teams_classify_and_fold_members_orphans_downgrade() {
     let orphan_extra = serde_json::json!({ "teamId": "ghost-team", "workspace": fx.temp_workspace("o") }).to_string();
     insert_conv(pool, USER, "orphan", None, &orphan_extra, 140).await;
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
 
     let proj = find_project(&resp, "proj-std");
     assert_eq!(team_ids(&proj.items), vec!["T1"], "team lands in the project group");
@@ -412,13 +502,21 @@ async fn pinned_item_leaves_its_natural_group() {
     insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await;
 
     // Before pin: c4 lives in its dir group, no pinned group.
-    let before = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let before = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     assert!(find_pinned(&before).is_none());
     assert_eq!(conv_ids(&find_dir(&before, "other").unwrap().items), vec!["c4"]);
 
     fx.service.pin(USER, "pinned", "conversation", "c4").await.unwrap();
 
-    let after = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let after = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     // Pinned group carries c4 with pinned=true.
     let pinned = find_pinned(&after).expect("pinned group present");
     assert_eq!(conv_ids(&pinned.items), vec!["c4"]);
@@ -495,7 +593,11 @@ async fn pinned_group_hides_a_conversation_that_became_a_live_team_member() {
         .unwrap();
     assert_eq!(row_count, 1, "the pinned row is present on disk");
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     let pinned = find_pinned(&resp);
     let pinned_convs = pinned.map(|g| conv_ids(&g.items)).unwrap_or_default();
     assert!(
@@ -524,7 +626,11 @@ async fn first_screen_is_user_scoped() {
     // USER's own single conversation.
     insert_conv_ws(pool, USER, "mine", "/repo/mine", 50).await;
 
-    let resp = fx.service.first_screen(USER, Some(50), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     assert!(
         !resp
             .groups
@@ -547,7 +653,11 @@ async fn chats_paging_is_continuous_no_dup_no_miss() {
     }
 
     // First screen with a window of 2 over chats.
-    let resp = fx.service.first_screen(USER, Some(2), &[]).await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(2), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
     let chats = find_chats(&resp);
     assert!(chats.has_more);
     let mut seen = conv_ids(&chats.items);
@@ -556,7 +666,11 @@ async fn chats_paging_is_continuous_no_dup_no_miss() {
 
     // Page the rest via the items endpoint.
     while let Some(c) = cursor {
-        let page = fx.service.items(USER, "chats", Some(&c), Some(2)).await.unwrap();
+        let page = fx
+            .service
+            .items(USER, "chats", Some(&c), Some(2), ArchiveScope::Active)
+            .await
+            .unwrap();
         seen.extend(conv_ids(&page.items));
         cursor = page.next_cursor;
         if !page.has_more {
@@ -576,13 +690,17 @@ async fn items_on_missing_scope_is_scope_gone() {
 
     let err = fx
         .service
-        .items(USER, "project:no-such", None, Some(10))
+        .items(USER, "project:no-such", None, Some(10), ArchiveScope::Active)
         .await
         .unwrap_err();
     assert!(matches!(err, SidebarError::ScopeGone), "stale project scope -> 404");
 
     // A syntactically bad scope is a 400, not a 404.
-    let err = fx.service.items(USER, "bogus", None, Some(10)).await.unwrap_err();
+    let err = fx
+        .service
+        .items(USER, "bogus", None, Some(10), ArchiveScope::Active)
+        .await
+        .unwrap_err();
     assert!(matches!(err, SidebarError::BadRequest(_)));
 }
 
@@ -876,4 +994,230 @@ async fn remove_project_on_missing_or_nonstandard_scope_is_scope_gone() {
     // Neither attempt invoked a port.
     assert!(ports.deleted_convs.lock().unwrap().is_empty());
     assert!(!*ports.project_deleted.lock().unwrap());
+}
+
+// -- Archive write: slice move, team cascade, D6 unpin, 404, batch delete -----
+
+/// Read a conversation's `archived_at` (NULL → `None`).
+async fn conv_archived_at(pool: &SqlitePool, id: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT archived_at FROM conversations WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Read a team's `archived_at` (NULL → `None`).
+async fn team_archived_at(pool: &SqlitePool, id: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT archived_at FROM teams WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// All conversation ids visible anywhere in a response (flattened over groups).
+fn all_conv_ids(resp: &aionui_api_types::SidebarResponse) -> Vec<String> {
+    let mut ids: Vec<String> = resp.groups.iter().flat_map(|g| conv_ids(&g.items)).collect();
+    ids.sort();
+    ids
+}
+
+/// All team ids visible anywhere in a response (flattened over groups).
+fn all_team_ids(resp: &aionui_api_types::SidebarResponse) -> Vec<String> {
+    let mut ids: Vec<String> = resp.groups.iter().flat_map(|g| team_ids(&g.items)).collect();
+    ids.sort();
+    ids
+}
+
+/// Archiving a team must carry its folded member conversations into the archived
+/// slice *with the same `archived_at`* (a single `now`), or `aggregate_teams`
+/// would fold members against a team living in the other slice. The active view
+/// loses the whole unit; the archived view folds it back together.
+#[tokio::test]
+async fn archive_team_cascades_members_sharing_one_now() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_team(pool, USER, "T1", "", None, 100).await;
+    insert_member(pool, USER, "m1", "T1", 90).await;
+    insert_member(pool, USER, "m2", "T1", 80).await;
+
+    // Active view before: the team folds both members, nothing archived yet.
+    let before = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert_eq!(all_team_ids(&before), vec!["T1"], "team is active before archive");
+
+    fx.service.archive_team(USER, "T1").await.unwrap();
+
+    // The team and *both* members share one non-null `archived_at`.
+    let at = team_archived_at(pool, "T1").await.expect("team archived");
+    assert_eq!(conv_archived_at(pool, "m1").await, Some(at), "m1 shares team's now");
+    assert_eq!(conv_archived_at(pool, "m2").await, Some(at), "m2 shares team's now");
+
+    // Active view: the whole unit is gone (team row + folded members).
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert!(all_team_ids(&active).is_empty(), "team gone from active");
+    assert!(all_conv_ids(&active).is_empty(), "no orphan members left in active");
+
+    // Archived view: the team folds its members back together (co-slice).
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert_eq!(all_team_ids(&archived), vec!["T1"], "team surfaces in archive");
+    let team = archived
+        .groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .find_map(|i| match i {
+            SidebarItem::Team(t) if t.team_id == "T1" => Some(t),
+            _ => None,
+        })
+        .expect("team row in archive");
+    let mut members = team.member_conversation_ids.clone();
+    members.sort();
+    assert_eq!(members, vec!["m1", "m2"], "members fold under the archived team");
+}
+
+/// Unarchiving a team cascades its members back to the active slice as one unit.
+#[tokio::test]
+async fn unarchive_team_cascades_members_back_to_active() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_team(pool, USER, "T1", "", None, 100).await;
+    insert_member(pool, USER, "m1", "T1", 90).await;
+    fx.service.archive_team(USER, "T1").await.unwrap();
+
+    fx.service.unarchive_team(USER, "T1").await.unwrap();
+
+    assert_eq!(team_archived_at(pool, "T1").await, None, "team back to active");
+    assert_eq!(conv_archived_at(pool, "m1").await, None, "member back to active");
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert_eq!(all_team_ids(&active), vec!["T1"], "team visible in active again");
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert!(all_team_ids(&archived).is_empty(), "nothing left archived");
+}
+
+/// Archiving a conversation moves it to the archived slice and (D6) drops its
+/// pinned `user_order` row, so it does not reappear pinned after unarchive.
+#[tokio::test]
+async fn archive_conversation_moves_slice_and_unpins() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "c1", None, "{}", 100).await;
+    fx.service.pin(USER, "pinned", "conversation", "c1").await.unwrap();
+    assert_eq!(user_order_count(pool, USER, "c1").await, 1, "pinned before archive");
+
+    fx.service.archive_conversation(USER, "c1").await.unwrap();
+
+    assert!(conv_archived_at(pool, "c1").await.is_some(), "moved to archived slice");
+    assert_eq!(user_order_count(pool, USER, "c1").await, 0, "D6: archiving unpins");
+
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert!(all_conv_ids(&active).is_empty(), "gone from active");
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert_eq!(
+        conv_ids(&find_chats(&archived).items),
+        vec!["c1"],
+        "surfaces in archive"
+    );
+}
+
+/// Archiving an unknown id, or another user's conversation, is a 404
+/// (`ScopeGone`) and touches nothing.
+#[tokio::test]
+async fn archive_of_unknown_or_foreign_id_is_scope_gone() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, OTHER, "foreign", None, "{}", 100).await;
+
+    let err = fx.service.archive_conversation(USER, "no-such").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "unknown conversation → 404");
+    let err = fx.service.archive_conversation(USER, "foreign").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "foreign conversation → 404");
+    assert_eq!(conv_archived_at(pool, "foreign").await, None, "foreign row untouched");
+
+    let err = fx.service.archive_team(USER, "no-such").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "unknown team → 404");
+}
+
+/// `delete_all_archived` hard-deletes every archived team (members cascade with
+/// it) and every independent archived conversation, while leaving the active
+/// slice untouched. Counts report visible units only (members fold into teams).
+#[tokio::test]
+async fn delete_all_archived_removes_archived_units_leaving_active() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    // Archived: one team (with a member) + one independent conversation.
+    insert_team(pool, USER, "T1", "", None, 100).await;
+    insert_member(pool, USER, "m1", "T1", 90).await;
+    insert_conv(pool, USER, "gone", None, "{}", 80).await;
+    fx.service.archive_team(USER, "T1").await.unwrap();
+    fx.service.archive_conversation(USER, "gone").await.unwrap();
+    // Active: an untouched conversation.
+    insert_conv(pool, USER, "keep", None, "{}", 70).await;
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let result = fx.service.delete_all_archived(USER).await.unwrap();
+    assert_eq!(result.teams_deleted, 1, "the archived team counted");
+    assert_eq!(
+        result.conversations_deleted, 1,
+        "only the independent archived conv counted"
+    );
+
+    assert!(!conv_exists(pool, "gone").await, "independent archived conv deleted");
+    assert!(!conv_exists(pool, "m1").await, "team member cascaded out");
+    let team_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = 'T1'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(team_left, 0, "archived team deleted");
+    assert!(conv_exists(pool, "keep").await, "active conversation untouched");
+}
+
+/// `delete_all_archived` is best-effort: a failing port on one unit does not
+/// abort the batch, and only the successful deletes are counted.
+#[tokio::test]
+async fn delete_all_archived_is_best_effort_on_port_failure() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "a", None, "{}", 100).await;
+    insert_conv(pool, USER, "b", None, "{}", 90).await;
+    fx.service.archive_conversation(USER, "a").await.unwrap();
+    fx.service.archive_conversation(USER, "b").await.unwrap();
+
+    // Deleting `a` fails; `b` must still be removed.
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &["a"]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let result = fx.service.delete_all_archived(USER).await.unwrap();
+    assert_eq!(result.conversations_deleted, 1, "only b counted");
+    assert!(conv_exists(pool, "a").await, "failed delete left a in place");
+    assert!(!conv_exists(pool, "b").await, "sibling delete still ran");
 }

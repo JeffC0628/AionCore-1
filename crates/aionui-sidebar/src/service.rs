@@ -18,14 +18,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use aionui_api_types::{
-    ConversationResponse, RemoveProjectItem, RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem,
-    SidebarItemsResponse, SidebarResponse, SidebarScope, SidebarTeamItem,
+    ArchiveDeleteResult, ConversationResponse, RemoveProjectItem, RemoveProjectItemKind, RemoveProjectResult,
+    SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope, SidebarTeamItem,
 };
+use aionui_common::now_ms;
 use aionui_conversation::{is_temp_session_workspace, row_to_response_with_extra};
 use aionui_db::models::ConversationRow;
 use aionui_db::{
-    ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, OrderScene, PinnedCursor, SidebarConversationThin,
-    SidebarProjectMeta, SidebarTeamThin,
+    ArchiveScope, ISidebarStore, IUserOrderStore, OrderItemRef, OrderItemType, OrderScene, PinnedCursor,
+    SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
 };
 use aionui_project::canonical;
 
@@ -91,6 +92,59 @@ impl SidebarService {
         Ok(())
     }
 
+    // -- Archive (D6: archiving unpins) --------------------------------------
+
+    /// Archive a conversation: move it into the archived slice, then drop any
+    /// pinned row (D6 — an archived item is never pinned). A missing / foreign id
+    /// is `ScopeGone` (404); the flip is otherwise idempotent for the slice.
+    pub async fn archive_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        if !self
+            .sidebar
+            .set_conversation_archived(user_id, id, Some(now_ms()))
+            .await?
+        {
+            return Err(SidebarError::ScopeGone);
+        }
+        self.unpin_item(user_id, OrderItemType::Conversation, id).await
+    }
+
+    /// Unarchive a conversation back into the active slice. Missing id →
+    /// `ScopeGone`. No re-pin: the pinned row was dropped at archive time (D6) and
+    /// is not restored.
+    pub async fn unarchive_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        if !self.sidebar.set_conversation_archived(user_id, id, None).await? {
+            return Err(SidebarError::ScopeGone);
+        }
+        Ok(())
+    }
+
+    /// Archive a team. The store cascades the flip to the team's member
+    /// conversations so the folded unit stays in one slice; the team's own pinned
+    /// row is then dropped (D6). Missing team → `ScopeGone`.
+    pub async fn archive_team(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        if !self.sidebar.set_team_archived(user_id, id, Some(now_ms())).await? {
+            return Err(SidebarError::ScopeGone);
+        }
+        self.unpin_item(user_id, OrderItemType::Team, id).await
+    }
+
+    /// Unarchive a team (the store cascades its members back). Missing team →
+    /// `ScopeGone`.
+    pub async fn unarchive_team(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        if !self.sidebar.set_team_archived(user_id, id, None).await? {
+            return Err(SidebarError::ScopeGone);
+        }
+        Ok(())
+    }
+
+    /// Drop an item's pinned row (idempotent) — the D6 unpin shared by both
+    /// archive paths.
+    async fn unpin_item(&self, user_id: &str, item_type: OrderItemType, id: &str) -> Result<(), SidebarError> {
+        let item = OrderItemRef::new(item_type, id.to_owned());
+        self.user_order.unpin(user_id, OrderScene::Pinned, &item).await?;
+        Ok(())
+    }
+
     // -- Remove project (BR-19 / D13 "所见即所删") ---------------------------
 
     /// Remove a standard project: delete every unit that renders into its group,
@@ -126,8 +180,13 @@ impl SidebarService {
         project_id: &str,
         dry_run: bool,
     ) -> Result<RemoveProjectResult, SidebarError> {
-        let convs = self.sidebar.list_active_conversations_thin(user_id).await?;
-        let teams = self.sidebar.list_active_teams_thin(user_id).await?;
+        // Project removal operates on the active universe; archived rows are not
+        // enumerated here (their deletion is the archive page's own batch path).
+        let convs = self
+            .sidebar
+            .list_conversations_thin(user_id, ArchiveScope::Active)
+            .await?;
+        let teams = self.sidebar.list_teams_thin(user_id, ArchiveScope::Active).await?;
         let projects = self.sidebar.list_user_projects(user_id).await?;
 
         // Same project maps `classify` builds: id→meta and standard-canonical→id.
@@ -191,7 +250,7 @@ impl SidebarService {
                 .collect();
 
             let team_name: HashMap<&str, &str> = teams.iter().map(|t| (t.id.as_str(), t.name.as_str())).collect();
-            let conv_resp = self.hydrate(user_id, &conv_ids).await?;
+            let conv_resp = self.hydrate(user_id, &conv_ids, ArchiveScope::Active).await?;
 
             let mut items: Vec<RemoveProjectItem> = Vec::with_capacity(team_ids.len() + conv_ids.len());
             for team_id in &team_ids {
@@ -261,6 +320,66 @@ impl SidebarService {
         })
     }
 
+    // -- Empty archive (batch hard-delete) -----------------------------------
+
+    /// Hard-delete **everything** in the archive slice: every archived team (its
+    /// member conversations cascade with it) and every independent archived
+    /// conversation. Member conversations are not deleted individually — they are
+    /// folded into their team and removed by the team cascade, mirroring
+    /// [`remove_project`](Self::remove_project)'s accounting.
+    ///
+    /// Deletion is **best-effort per entity** (same rationale as `remove_project`:
+    /// killing agents / dropping dirs / cross-service hooks cannot share one DB
+    /// transaction); a failed unit is logged and skipped, and the reported counts
+    /// are of units actually removed.
+    pub async fn delete_all_archived(&self, user_id: &str) -> Result<ArchiveDeleteResult, SidebarError> {
+        let convs = self
+            .sidebar
+            .list_conversations_thin(user_id, ArchiveScope::Archived)
+            .await?;
+        let teams = self.sidebar.list_teams_thin(user_id, ArchiveScope::Archived).await?;
+
+        // Fold members into their (archived) team; independents are the loose
+        // archived conversations to delete on their own. A member whose team is
+        // *not* in the archived slice downgrades to an independent here (BR-8) and
+        // is deleted directly rather than left dangling.
+        let (team_by_id, independents) = aggregate_teams(convs, teams.clone());
+        let team_ids: Vec<&str> = teams
+            .iter()
+            .filter(|t| team_by_id.contains_key(&t.id))
+            .map(|t| t.id.as_str())
+            .collect();
+
+        let ports = self
+            .remove_project_ports
+            .get()
+            .ok_or_else(|| SidebarError::Internal("remove_project ports not wired".into()))?;
+
+        let mut teams_deleted = 0i64;
+        for team_id in &team_ids {
+            match ports.remove_team(user_id, team_id).await {
+                Ok(()) => teams_deleted += 1,
+                Err(err) => tracing::warn!(team_id = %team_id, error = %err, "empty_archive: team delete failed"),
+            }
+        }
+
+        let mut conversations_deleted = 0i64;
+        for conv in &independents {
+            match ports.delete_conversation(user_id, &conv.id).await {
+                Ok(()) => conversations_deleted += 1,
+                Err(err) => {
+                    tracing::warn!(conversation_id = %conv.id, error = %err, "empty_archive: conversation delete failed")
+                }
+            }
+        }
+
+        tracing::info!(teams_deleted, conversations_deleted, "Archive emptied (best-effort)");
+        Ok(ArchiveDeleteResult {
+            teams_deleted,
+            conversations_deleted,
+        })
+    }
+
     // -- Read side (first screen / paging) -----------------------------------
 
     /// First screen: `pinned → project-area (project + dir interleaved) → chats`.
@@ -271,25 +390,29 @@ impl SidebarService {
         user_id: &str,
         limit: Option<i64>,
         win: &[(String, i64)],
+        scope: ArchiveScope,
     ) -> Result<SidebarResponse, SidebarError> {
         let default_limit = limit.unwrap_or(DEFAULT_LIMIT);
         let win_map: HashMap<&str, i64> = win.iter().map(|(t, l)| (t.as_str(), *l)).collect();
-        let snapshot = self.classify(user_id).await?;
+        let snapshot = self.classify(user_id, scope).await?;
 
         let mut groups: Vec<SidebarGroup> = Vec::new();
 
-        // Pinned group (only rendered when non-empty).
-        let pinned_limit = win_map.get("pinned").copied().unwrap_or(default_limit);
-        let pinned = self
-            .page_pinned(user_id, None, pinned_limit, &snapshot.team_by_id)
-            .await?;
-        if !pinned.items.is_empty() {
-            groups.push(SidebarGroup {
-                scope: SidebarScope::Pinned,
-                items: pinned.items,
-                has_more: pinned.has_more,
-                next_cursor: pinned.next_cursor,
-            });
+        // Pinned group (active slice only, and only rendered when non-empty). The
+        // archive page has no pinned section (D6: archiving unpins).
+        if scope == ArchiveScope::Active {
+            let pinned_limit = win_map.get("pinned").copied().unwrap_or(default_limit);
+            let pinned = self
+                .page_pinned(user_id, None, pinned_limit, &snapshot.team_by_id)
+                .await?;
+            if !pinned.items.is_empty() {
+                groups.push(SidebarGroup {
+                    scope: SidebarScope::Pinned,
+                    items: pinned.items,
+                    has_more: pinned.has_more,
+                    next_cursor: pinned.next_cursor,
+                });
+            }
         }
 
         // Natural groups: project area (already ordered) then chats. Collect the
@@ -311,7 +434,7 @@ impl SidebarService {
             windows.push((group, take, has_more));
         }
 
-        let hydrated = self.hydrate(user_id, &conv_ids).await?;
+        let hydrated = self.hydrate(user_id, &conv_ids, scope).await?;
 
         for (group, take, has_more) in windows {
             let items = assemble_items(&group.items[..take], &hydrated, &snapshot.team_by_id, false);
@@ -344,6 +467,7 @@ impl SidebarService {
         scope: &str,
         cursor: Option<&str>,
         limit: Option<i64>,
+        archive: ArchiveScope,
     ) -> Result<SidebarItemsResponse, SidebarError> {
         let token =
             ScopeToken::parse(scope).ok_or_else(|| SidebarError::BadRequest(format!("unknown scope: {scope}")))?;
@@ -351,11 +475,16 @@ impl SidebarService {
         validate_limit(limit)?;
 
         if let ScopeToken::Pinned = token {
+            // Pinned is an active-only group; the archive slice has no such scope,
+            // so a pinned page request against it targets a group that isn't there.
+            if archive != ArchiveScope::Active {
+                return Err(SidebarError::ScopeGone);
+            }
             let after = match cursor {
                 Some(raw) => Some(to_pinned_cursor(Cursor::decode(raw, &token)?)?),
                 None => None,
             };
-            let team_by_id = self.load_team_aggregates(user_id).await?;
+            let team_by_id = self.load_team_aggregates(user_id, ArchiveScope::Active).await?;
             let page = self.page_pinned(user_id, after.as_ref(), limit, &team_by_id).await?;
             return Ok(SidebarItemsResponse {
                 items: page.items,
@@ -365,7 +494,7 @@ impl SidebarService {
         }
 
         // Natural scope: classify, find the named group (stale → 404), page it.
-        let snapshot = self.classify(user_id).await?;
+        let snapshot = self.classify(user_id, archive).await?;
         let group = match &token {
             ScopeToken::Chats => &snapshot.chats,
             _ => snapshot
@@ -378,7 +507,7 @@ impl SidebarService {
             Some(raw) => Some(Cursor::decode(raw, &token)?),
             None => None,
         };
-        self.page_natural(user_id, group, cursor.as_ref(), limit).await
+        self.page_natural(user_id, group, cursor.as_ref(), limit, archive).await
     }
 
     /// Window a natural group after `cursor`, hydrate, and assemble.
@@ -388,6 +517,7 @@ impl SidebarService {
         group: &NaturalGroup,
         cursor: Option<&Cursor>,
         limit: i64,
+        scope: ArchiveScope,
     ) -> Result<SidebarItemsResponse, SidebarError> {
         // Items are sorted later-first, so the "after cursor" set is a suffix.
         let after: Vec<&GroupItemRef> = group.items.iter().filter(|i| i.is_after(cursor)).collect();
@@ -401,7 +531,7 @@ impl SidebarService {
                 GroupItemRef::Team { .. } => None,
             })
             .collect();
-        let hydrated = self.hydrate(user_id, &conv_ids).await?;
+        let hydrated = self.hydrate(user_id, &conv_ids, scope).await?;
 
         let window: Vec<GroupItemRef> = after[..take].iter().map(|i| (*i).clone()).collect();
         let items = assemble_items(&window, &hydrated, &group.team_by_id_ref(), false);
@@ -447,7 +577,9 @@ impl SidebarService {
             .filter(|r| r.item_type == OrderItemType::Conversation.as_str() && !member_ids.contains(r.item_id.as_str()))
             .map(|r| r.item_id.clone())
             .collect();
-        let hydrated = self.hydrate(user_id, &conv_ids).await?;
+        // The pinned scene is active-only (D6: archiving unpins), so its members
+        // always hydrate from the active slice.
+        let hydrated = self.hydrate(user_id, &conv_ids, ArchiveScope::Active).await?;
 
         let mut items: Vec<SidebarItem> = Vec::with_capacity(window.len());
         for row in window {
@@ -488,11 +620,12 @@ impl SidebarService {
         &self,
         user_id: &str,
         ids: &[String],
+        scope: ArchiveScope,
     ) -> Result<HashMap<String, ConversationResponse>, SidebarError> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows = self.sidebar.hydrate_conversations(user_id, ids).await?;
+        let rows = self.sidebar.hydrate_conversations(user_id, ids, scope).await?;
         let mut out = HashMap::with_capacity(rows.len());
         for row in rows {
             let id = row.id.clone();
@@ -513,24 +646,38 @@ impl SidebarService {
     /// Build team aggregates only (used by the pinned items path, which needs no
     /// group classification). Members are folded into their team; orphan members
     /// downgrade to independents (BR-8) but independents are discarded here.
-    async fn load_team_aggregates(&self, user_id: &str) -> Result<HashMap<String, TeamAgg>, SidebarError> {
-        let convs = self.sidebar.list_active_conversations_thin(user_id).await?;
-        let teams = self.sidebar.list_active_teams_thin(user_id).await?;
+    async fn load_team_aggregates(
+        &self,
+        user_id: &str,
+        scope: ArchiveScope,
+    ) -> Result<HashMap<String, TeamAgg>, SidebarError> {
+        let convs = self.sidebar.list_conversations_thin(user_id, scope).await?;
+        let teams = self.sidebar.list_teams_thin(user_id, scope).await?;
         Ok(aggregate_teams(convs, teams).0)
     }
 
     /// Full classification snapshot: team aggregates, independents + teams sorted
     /// into groups (5-case matrix), the ordered/truncated project area, and the
     /// chats group.
-    async fn classify(&self, user_id: &str) -> Result<Snapshot, SidebarError> {
-        let convs = self.sidebar.list_active_conversations_thin(user_id).await?;
-        let teams = self.sidebar.list_active_teams_thin(user_id).await?;
+    async fn classify(&self, user_id: &str, scope: ArchiveScope) -> Result<Snapshot, SidebarError> {
+        let convs = self.sidebar.list_conversations_thin(user_id, scope).await?;
+        let teams = self.sidebar.list_teams_thin(user_id, scope).await?;
+        // Projects are never archived: the whole enumeration drives grouping and
+        // path-merge in both slices.
         let projects = self.sidebar.list_user_projects(user_id).await?;
-        let pinned_refs = self.user_order.pinned_refs(user_id, OrderScene::Pinned).await?;
-        let pinned_set: HashSet<(String, String)> = pinned_refs
-            .iter()
-            .map(|r| (r.item_type.as_str().to_owned(), r.item_id.clone()))
-            .collect();
+        // Pins are an active-only concept (D6: archiving unpins). In the archived
+        // slice no row is pinned, so the pinned set is empty and the pinned-refs
+        // query (global, not archive-scoped) is skipped entirely.
+        let pinned_set: HashSet<(String, String)> = match scope {
+            ArchiveScope::Active => {
+                let pinned_refs = self.user_order.pinned_refs(user_id, OrderScene::Pinned).await?;
+                pinned_refs
+                    .iter()
+                    .map(|r| (r.item_type.as_str().to_owned(), r.item_id.clone()))
+                    .collect()
+            }
+            ArchiveScope::Archived => HashSet::new(),
+        };
 
         // Project maps: id→meta and standard-canonical→id (path merge, BR case 3).
         let by_id: HashMap<&str, &SidebarProjectMeta> = projects.iter().map(|p| (p.project_id.as_str(), p)).collect();
@@ -590,9 +737,13 @@ impl SidebarService {
             );
         }
 
-        // Spine: every standard project surfaces even with zero units (BR-5).
-        for project in projects.iter().filter(|p| p.kind == KIND_STANDARD) {
-            builder.ensure_standard_spine(project);
+        // Spine: every standard project surfaces even with zero units (BR-5) —
+        // active slice only. The archive page lists only projects that actually
+        // hold archived items, so an empty standard project must not appear there.
+        if scope == ArchiveScope::Active {
+            for project in projects.iter().filter(|p| p.kind == KIND_STANDARD) {
+                builder.ensure_standard_spine(project);
+            }
         }
 
         let (project_area, chats, has_more_groups) = builder.finish(team_by_id.clone());
