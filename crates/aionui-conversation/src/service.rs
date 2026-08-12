@@ -4466,6 +4466,15 @@ fn auto_provisioned_workspace_to_delete(
     Some(workspace_path)
 }
 
+/// True when `leaf` is an auto-generated workspace directory name. Auto/temp
+/// workspace leaves are always `{label}-temp-{id}` (conversations) or
+/// `team-temp-{team_id}` (teams); the `-temp-` marker has been stable across
+/// every historical layout, so it is the sole signal the root-agnostic read
+/// predicate ([`is_temp_session_workspace`]) can rely on.
+fn is_temp_leaf(leaf: &str) -> bool {
+    leaf.contains("-temp-")
+}
+
 fn is_auto_workspace_relative_path(relative: &Path) -> bool {
     let parts = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
     let Some(parts) = parts else {
@@ -4481,13 +4490,6 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
             && day.chars().all(|ch| ch.is_ascii_digit())
     };
 
-    // Auto/temp workspace leaves are always `{label}-temp-{id}` (conversations)
-    // or `team-temp-{team_id}` (teams); the `-temp-` marker has been stable
-    // across every historical layout. Requiring it keeps the root-agnostic
-    // match (see [`is_temp_session_workspace`]) from misclassifying a user
-    // directory that merely sits under some `conversations/` ancestor.
-    let is_temp_leaf = |leaf: &str| leaf.contains("-temp-");
-
     match parts.as_slice() {
         // legacy: bare leaf, or {Y}/{M}/{D}/leaf
         [leaf] => is_temp_leaf(leaf),
@@ -4501,15 +4503,23 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
 /// True when `workspace` is a backend auto-generated temp session directory —
 /// the sidebar read model's "temp path" test.
 ///
-/// Root-agnostic: matches the auto-workspace layout after the LAST
-/// `conversations` path segment, regardless of which data-dir root precedes
-/// it. This is deliberate. Users who migrated their conversation directory
-/// across releases carry `extra.workspace` values baked under a *previous*
-/// root; anchoring on the current `work_dir` would strip-fail on those and
-/// misclassify historical temp sessions as projects. The layout after
-/// `conversations/` has always ended in a `-temp-` leaf, so
-/// [`is_auto_workspace_relative_path`] keys on that marker rather than the
-/// (mutable) root prefix.
+/// Classifies on the workspace *leaf* alone: an auto/temp workspace's final
+/// path segment is always `{label}-temp-{id}` or `team-temp-{team_id}`, and the
+/// `-temp-` marker has been stable across every layout the backend has ever
+/// generated — OS temp dir, bare `<data_dir>/{leaf}`, `<data_dir>/tmp/{leaf}`,
+/// and every `<data_dir>/conversations/...` shape (bare, date-partitioned,
+/// per-user). None of those share a container segment, so the leaf is the only
+/// signal common to all of them.
+///
+/// Container-agnostic (and therefore root-agnostic) is deliberate. Users who
+/// migrated their conversation directory across releases carry `extra.workspace`
+/// values baked under a *previous* root; anchoring on the current `work_dir` (or
+/// on a `conversations`/`tmp` container that the earliest layouts lack) would
+/// strip-fail on those and misclassify historical temp sessions as projects.
+/// Trading that off, a user-selected project directory whose own name literally
+/// contains `-temp-` is a false positive here; that is accepted — a project row
+/// carries its own `kind` (`standard`/`temp`) as the authoritative signal, and a
+/// mislabeled one can be promoted `temp -> standard`.
 ///
 /// Pure lexical (no filesystem access), so it is safe on the side-effect-free
 /// sidebar read path — dead/removed workspaces classify correctly rather than
@@ -4517,16 +4527,10 @@ fn is_auto_workspace_relative_path(relative: &Path) -> bool {
 /// `extra.workspace` (or a team's `workspace` column) without duplicating the
 /// rule.
 pub fn is_temp_session_workspace(workspace: &Path) -> bool {
-    let parts = workspace.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
-    let Some(parts) = parts else {
-        return false;
-    };
-    // Classify the tail after the LAST `conversations` segment (root-agnostic).
-    let Some(idx) = parts.iter().rposition(|part| *part == "conversations") else {
-        return false;
-    };
-    let relative: PathBuf = parts[idx + 1..].iter().collect();
-    is_auto_workspace_relative_path(&relative)
+    workspace
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .is_some_and(is_temp_leaf)
 }
 
 async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {

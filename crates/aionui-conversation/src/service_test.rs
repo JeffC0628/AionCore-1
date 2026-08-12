@@ -8441,73 +8441,101 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
 }
 
-// --- is_temp_session_workspace: root-agnostic temp-directory judgment ---
+// --- is_temp_session_workspace: leaf-marker temp-directory judgment ---
 //
-// These lock the historical-debt fix: a temp workspace is recognized by the
-// auto-workspace layout after the LAST `conversations` segment plus a `-temp-`
-// leaf marker, regardless of which data-dir root precedes it. Users who
-// migrated their conversation directory across releases carry workspaces baked
-// under a *previous* root; those must still classify as temp.
+// A temp workspace is recognized by its LEAF alone: an auto-generated leaf is
+// always `{label}-temp-{id}` or `team-temp-{team_id}`, and `-temp-` is the only
+// signal shared by every layout the backend has ever emitted (OS temp dir, bare
+// `<data_dir>/{leaf}`, `<data_dir>/tmp/{leaf}`, and every `conversations/...`
+// shape). Container-/root-agnostic on purpose: migrated data-dirs carry
+// workspaces baked under a previous root, and the earliest layouts have no
+// container segment at all, so anchoring on a root or a `conversations`/`tmp`
+// container would strip-fail on real historical temp rows. A user project whose
+// own directory name contains `-temp-` is an accepted false positive here — a
+// project row's `kind` (`standard`/`temp`) is the authoritative signal and a
+// mislabeled one can be promoted `temp -> standard`.
 
 #[test]
-fn temp_workspace_current_root_is_recognized() {
-    // No regression for workspaces under the live root.
-    assert!(is_temp_session_workspace(Path::new(
-        "/srv/aionui-data/conversations/users/u1/2026/08/11/acp-temp-conv-1"
-    )));
-}
+fn is_temp_session_workspace_classifies_every_layout() {
+    // (workspace, expected_temp, why). One row per historical layout plus the
+    // negative guards and the one accepted false positive.
+    let cases: &[(&str, bool, &str)] = &[
+        // --- positive: every auto-generated layout the backend has emitted ---
+        (
+            "/srv/aionui-data/conversations/users/u1/2026/08/11/acp-temp-conv-1",
+            true,
+            "current per-user dated layout under the live root",
+        ),
+        (
+            "/old-data/aionui/conversations/users/u1/2025/01/02/acp-temp-conv-1",
+            true,
+            "same layout but a migrated (older) root prefix must not defeat it",
+        ),
+        (
+            "/srv/aionui-data/conversations/users/u1/2026/08/11/team-temp-team_1",
+            true,
+            "team temp leaf",
+        ),
+        (
+            "/old/conversations/claude-temp-xyz",
+            true,
+            "early conversations/ layout: bare -temp- leaf, no dated dirs",
+        ),
+        (
+            "/old/conversations/2025/01/02/acp-temp-conv-1",
+            true,
+            "date-partitioned conversations/ layout",
+        ),
+        (
+            "/Users/me/Library/Application Support/aionui/codex-temp-1776940954621",
+            true,
+            "pre-conversations/ bare leaf at the data-dir root (digit-timestamp id)",
+        ),
+        (
+            "/srv/aionui-data/tmp/acp-temp-1699999999",
+            true,
+            "original <data_dir>/tmp/ container layout",
+        ),
+        (
+            "/old-data/aionui/tmp/claude-temp-1650000000",
+            true,
+            "tmp/ container under a migrated root",
+        ),
+        (
+            "/var/folders/xy/abc/T/codex-temp-1699999999",
+            true,
+            "earliest layout: leaf under the OS temp dir, no app container at all",
+        ),
+        // --- negative: no -temp- leaf marker ---
+        (
+            "/home/me/conversations/myproj",
+            false,
+            "user dir merely under a conversations/ ancestor, no -temp- leaf",
+        ),
+        ("/home/me/work/proj", false, "plain project path, no marker"),
+        (
+            "/srv/aionui-data/conversations",
+            false,
+            "the container dir itself, no leaf marker",
+        ),
+        (
+            "/home/me/tmp/scratch",
+            false,
+            "plain scratch dir under tmp/, no -temp- leaf marker",
+        ),
+        // --- accepted false positive (see is_temp_session_workspace doc) ---
+        (
+            "/home/me/work/my-temp-notes",
+            true,
+            "user project whose own leaf contains -temp-; project.kind overrides this",
+        ),
+    ];
 
-#[test]
-fn temp_workspace_migrated_old_root_is_recognized() {
-    // Core fix: a different (older) root prefix must not defeat the judgment.
-    assert!(is_temp_session_workspace(Path::new(
-        "/old-data/aionui/conversations/users/u1/2025/01/02/acp-temp-conv-1"
-    )));
-}
-
-#[test]
-fn temp_workspace_team_leaf_is_recognized() {
-    assert!(is_temp_session_workspace(Path::new(
-        "/srv/aionui-data/conversations/users/u1/2026/08/11/team-temp-team_1"
-    )));
-}
-
-#[test]
-fn temp_workspace_legacy_bare_leaf_is_recognized() {
-    // Earliest layout: no dated dirs, just a `-temp-` leaf under conversations.
-    assert!(is_temp_session_workspace(Path::new(
-        "/old/conversations/claude-temp-xyz"
-    )));
-}
-
-#[test]
-fn temp_workspace_legacy_dated_leaf_is_recognized() {
-    assert!(is_temp_session_workspace(Path::new(
-        "/old/conversations/2025/01/02/acp-temp-conv-1"
-    )));
-}
-
-#[test]
-fn user_project_under_conversations_is_not_temp() {
-    // Negative guard: a user directory that merely sits under some
-    // `conversations/` ancestor lacks the `-temp-` marker → not temp.
-    assert!(!is_temp_session_workspace(Path::new("/home/me/conversations/myproj")));
-}
-
-#[test]
-fn workspace_without_conversations_segment_is_not_temp() {
-    assert!(!is_temp_session_workspace(Path::new("/home/me/work/proj")));
-}
-
-#[test]
-fn temp_workspace_with_bad_date_is_not_temp() {
-    // Dated arm still requires numeric YYYY/MM/DD.
-    assert!(!is_temp_session_workspace(Path::new(
-        "/srv/aionui-data/conversations/users/u1/YY/MM/DD/acp-temp-1"
-    )));
-}
-
-#[test]
-fn bare_conversations_dir_is_not_temp() {
-    assert!(!is_temp_session_workspace(Path::new("/srv/aionui-data/conversations")));
+    for (workspace, expected, why) in cases {
+        assert_eq!(
+            is_temp_session_workspace(Path::new(workspace)),
+            *expected,
+            "{workspace} should classify temp={expected} ({why})",
+        );
+    }
 }
