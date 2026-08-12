@@ -1403,3 +1403,215 @@ async fn delete_archived_team_cascades_and_gates_foreign() {
         .unwrap();
     assert_eq!(foreign_left, 1, "foreign team untouched");
 }
+
+// -- Project-level archive / unarchive / delete (one request per project) ----
+
+/// Seed a standard project holding the full render construct: a bound
+/// conversation (case 1), a path-merged unbound conversation (case 3), a bound
+/// team with two folded members, plus an unrelated dir conversation and a chats
+/// conversation that must stay outside the project group.
+async fn seed_project_construct(fx: &Fixture) {
+    let pool = fx.pool();
+    insert_std_project(
+        pool,
+        USER,
+        "proj-std",
+        "Std",
+        &canon_of("/repo/std"),
+        &file_uri("/repo/std"),
+    )
+    .await;
+    insert_conv(pool, USER, "c1", Some("proj-std"), "{}", 100).await; // bound (case 1)
+    insert_conv_ws(pool, USER, "c3", "/repo/std", 90).await; // path-merged (case 3)
+    insert_team(pool, USER, "T1", "", Some("proj-std"), 200).await; // bound team
+    insert_member(pool, USER, "m1", "T1", 150).await;
+    insert_member(pool, USER, "m2", "T1", 160).await;
+    insert_conv_ws(pool, USER, "c4", "/repo/other", 70).await; // dir group -> keep
+    insert_conv_ws(pool, USER, "c5", &fx.temp_workspace("s"), 60).await; // chats -> keep
+}
+
+/// `archive_project` archives the whole visible construct in one call (bound +
+/// path-merged conv, team + folded members sharing one `now`), unpins each (D6),
+/// and leaves unrelated dir/chats rows in the active slice.
+#[tokio::test]
+async fn archive_project_archives_the_visible_construct_and_unpins() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    seed_project_construct(&fx).await;
+
+    // Pin a conv and the team so we can assert D6 unpin.
+    fx.service.pin(USER, "pinned", "conversation", "c1").await.unwrap();
+    fx.service.pin(USER, "pinned", "team", "T1").await.unwrap();
+
+    fx.service.archive_project(USER, "proj-std").await.unwrap();
+
+    // Bound + path-merged conv are archived; team + folded members share the team's now.
+    assert!(conv_archived_at(pool, "c1").await.is_some(), "bound conv archived");
+    assert!(
+        conv_archived_at(pool, "c3").await.is_some(),
+        "path-merged conv archived"
+    );
+    let team_at = team_archived_at(pool, "T1").await.expect("team archived");
+    assert_eq!(conv_archived_at(pool, "m1").await, Some(team_at), "m1 shares team now");
+    assert_eq!(conv_archived_at(pool, "m2").await, Some(team_at), "m2 shares team now");
+
+    // D6: pinned rows dropped for both archived units.
+    assert_eq!(user_order_count(pool, USER, "c1").await, 0, "conv unpinned");
+    assert_eq!(user_order_count(pool, USER, "T1").await, 0, "team unpinned");
+
+    // Unrelated rows stay active.
+    assert_eq!(conv_archived_at(pool, "c4").await, None, "dir conv untouched");
+    assert_eq!(conv_archived_at(pool, "c5").await, None, "chats conv untouched");
+
+    // Active view: the standard-project spine still surfaces, but empty — every
+    // unit moved to the archived slice; dir/chats survive.
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    let active_proj = find_project(&active, "proj-std");
+    assert!(conv_ids(&active_proj.items).is_empty(), "no active convs left");
+    assert!(team_ids(&active_proj.items).is_empty(), "no active teams left");
+
+    // Archived view: the whole construct folds back under the project group.
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    let proj = find_project(&archived, "proj-std");
+    assert_eq!(conv_ids(&proj.items), vec!["c1", "c3"], "convs under archived project");
+    assert_eq!(team_ids(&proj.items), vec!["T1"], "team under archived project");
+}
+
+/// A different user's standard project, and a temp project, are both `ScopeGone`
+/// for `archive_project` — nothing is touched.
+#[tokio::test]
+async fn archive_project_on_missing_or_nonstandard_scope_is_scope_gone() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_temp_project(pool, USER, "proj-temp").await;
+    insert_std_project(
+        pool,
+        OTHER,
+        "proj-foreign",
+        "Foreign",
+        &canon_of("/repo/foreign"),
+        &file_uri("/repo/foreign"),
+    )
+    .await;
+    insert_conv(pool, OTHER, "fc", Some("proj-foreign"), "{}", 100).await;
+
+    let err = fx.service.archive_project(USER, "no-such").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "unknown project → 404");
+    let err = fx.service.archive_project(USER, "proj-temp").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "temp project → 404");
+    let err = fx.service.archive_project(USER, "proj-foreign").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "foreign project → 404");
+    assert_eq!(conv_archived_at(pool, "fc").await, None, "foreign conv untouched");
+}
+
+/// `unarchive_project` restores the whole archived construct in one call: bound +
+/// path-merged conv and the team + members return to the active slice.
+#[tokio::test]
+async fn unarchive_project_restores_the_archived_construct() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    seed_project_construct(&fx).await;
+    fx.service.archive_project(USER, "proj-std").await.unwrap();
+
+    fx.service.unarchive_project(USER, "proj-std").await.unwrap();
+
+    assert_eq!(conv_archived_at(pool, "c1").await, None, "bound conv restored");
+    assert_eq!(conv_archived_at(pool, "c3").await, None, "path-merged conv restored");
+    assert_eq!(team_archived_at(pool, "T1").await, None, "team restored");
+    assert_eq!(conv_archived_at(pool, "m1").await, None, "m1 restored");
+    assert_eq!(conv_archived_at(pool, "m2").await, None, "m2 restored");
+
+    // Active view: the project group is back with its full construct.
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    let proj = find_project(&active, "proj-std");
+    assert_eq!(conv_ids(&proj.items), vec!["c1", "c3"], "convs back under project");
+    assert_eq!(team_ids(&proj.items), vec!["T1"], "team back under project");
+
+    // Archived view: nothing left.
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert!(archived.groups.iter().all(|g| g.items.is_empty()), "archive empty");
+}
+
+/// `delete_archived_project` hard-deletes only the archived units of a project
+/// (team cascades to members), **keeps the project record**, and never reaches
+/// the active slice.
+#[tokio::test]
+async fn delete_archived_project_removes_archived_units_keeps_record() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    seed_project_construct(&fx).await;
+    // Archive only the team; c1/c3 stay active to prove the delete never touches
+    // the active slice even though they belong to the same project group.
+    fx.service.archive_team(USER, "T1").await.unwrap();
+    fx.service.archive_conversation(USER, "c1").await.unwrap();
+    // c3 stays active.
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let result = fx.service.delete_archived_project(USER, "proj-std").await.unwrap();
+    assert_eq!(result.teams_deleted, 1, "archived team counted");
+    assert_eq!(result.conversations_deleted, 1, "only archived c1 counted");
+
+    // Archived units gone (team + folded members + the archived conv).
+    assert!(!conv_exists(pool, "c1").await, "archived conv deleted");
+    assert!(!conv_exists(pool, "m1").await, "team member cascaded out");
+    assert!(!conv_exists(pool, "m2").await, "team member cascaded out");
+    let team_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = 'T1'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(team_left, 0, "archived team deleted");
+
+    // Active-slice units of the same project are untouched.
+    assert!(conv_exists(pool, "c3").await, "active project conv untouched");
+    assert!(conv_exists(pool, "c4").await, "dir conv untouched");
+    assert!(conv_exists(pool, "c5").await, "chats conv untouched");
+
+    // The project record is kept (never deleted by this path).
+    let proj_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE project_id = 'proj-std'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(proj_left, 1, "project record kept");
+    assert!(
+        !*ports.project_deleted.lock().unwrap(),
+        "delete_project_record must never be called"
+    );
+}
+
+/// `delete_archived_project` gates non-standard / foreign scopes with `ScopeGone`
+/// before any port is touched.
+#[tokio::test]
+async fn delete_archived_project_on_missing_or_nonstandard_scope_is_scope_gone() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_temp_project(pool, USER, "proj-temp").await;
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let err = fx.service.delete_archived_project(USER, "no-such").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "unknown project → 404");
+    let err = fx.service.delete_archived_project(USER, "proj-temp").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "temp project → 404");
+
+    assert!(ports.deleted_teams.lock().unwrap().is_empty(), "no team port hit");
+    assert!(ports.deleted_convs.lock().unwrap().is_empty(), "no conv port hit");
+}

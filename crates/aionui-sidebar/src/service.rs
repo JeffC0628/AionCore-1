@@ -179,48 +179,36 @@ impl SidebarService {
         }
     }
 
-    // -- Remove project (BR-19 / D13 "所见即所删") ---------------------------
+    // -- Project-level operations (BR-19 / D13 "所见即所删") ------------------
 
-    /// Remove a standard project: delete every unit that renders into its group,
-    /// then the project record itself. When `dry_run` is set, nothing is deleted
-    /// and the returned counts are the preview (what *would* be removed).
+    /// Collect the units — teams and independent conversations — that render into
+    /// a standard project's group within one archive slice. This is the shared
+    /// membership resolution behind every project-level operation
+    /// (remove / archive / unarchive / delete-archived).
     ///
-    /// # Delete set
     /// The set is computed with the **same** classifier the renderer uses
-    /// ([`classify_unit`](Self::classify_unit)) over the active universe: a unit
-    /// is deleted iff it classifies into `Project(project_id)`. This is why
-    /// "所见即所删" holds — the delete set *is* the render construct, so it also
-    /// catches path-merged unbound items (a conversation whose workspace
-    /// canonicalizes onto this project's root, case 3) that carry no `project_id`.
-    /// Pinned units are included: pinning only hoists a row into the pinned group
-    /// for display, it does not change which project the row belongs to.
+    /// ([`classify_unit`](Self::classify_unit)): a unit belongs iff it classifies
+    /// into `Project(project_id)`. This is why "所见即所删" holds — the set *is*
+    /// the render construct, so it also catches path-merged unbound items (a
+    /// conversation whose workspace canonicalizes onto this project's root, case
+    /// 3) that carry no `project_id`. Pinned units are included: pinning only
+    /// hoists a row into the pinned group for display.
     ///
-    /// Team-member conversations are not enumerated here — they are folded into
-    /// their team and removed by the team cascade, "无论成员自身 project_id 为何";
-    /// a member whose *team* lands in another project is therefore not touched.
+    /// Team-member conversations are not enumerated on their own — they fold into
+    /// their team and travel with the team cascade, "无论成员自身 project_id 为何".
     ///
-    /// # Atomicity
-    /// Deletion is **best-effort per entity**, mirroring the standalone team
-    /// delete: killing agent processes, dropping filesystem dirs, and running
-    /// cross-service delete hooks cannot share one DB transaction, so D13's
-    /// "单事务原子 + 中途失败全回滚" is not literally achievable. A failed unit is
-    /// logged and skipped; the project record is dropped last, so a mid-way
-    /// failure leaves a smaller (self-consistent) project rather than orphaning
-    /// its contents. Only the archived-inclusion refinement is deferred to PR-B;
-    /// PR-A has no archiving, so the active universe is the whole universe.
-    pub async fn remove_project(
+    /// The target must be an owned **standard** project. Temp projects and
+    /// pseudo-dir groups are not addressable through this path → `ScopeGone`.
+    async fn collect_project_units(
         &self,
         user_id: &str,
         project_id: &str,
-        dry_run: bool,
-    ) -> Result<RemoveProjectResult, SidebarError> {
-        // Project removal operates on the active universe; archived rows are not
-        // enumerated here (their deletion is the archive page's own batch path).
-        let convs = self
-            .sidebar
-            .list_conversations_thin(user_id, ArchiveScope::Active)
-            .await?;
-        let teams = self.sidebar.list_teams_thin(user_id, ArchiveScope::Active).await?;
+        scope: ArchiveScope,
+    ) -> Result<(Vec<SidebarTeamThin>, Vec<SidebarConversationThin>), SidebarError> {
+        let convs = self.sidebar.list_conversations_thin(user_id, scope).await?;
+        let teams = self.sidebar.list_teams_thin(user_id, scope).await?;
+        // Projects are never archived; the full enumeration drives both id→meta
+        // binding and path-merge in either slice.
         let projects = self.sidebar.list_user_projects(user_id).await?;
 
         // Same project maps `classify` builds: id→meta and standard-canonical→id.
@@ -231,8 +219,6 @@ impl SidebarService {
             .filter_map(|p| p.workspace_canonical.as_deref().map(|c| (c, p.project_id.as_str())))
             .collect();
 
-        // The target must be an owned standard project. Temp projects and
-        // pseudo-dir groups are not removable through this path → 404.
         match by_id.get(project_id) {
             Some(meta) if meta.kind == KIND_STANDARD => {}
             _ => return Err(SidebarError::ScopeGone),
@@ -241,10 +227,9 @@ impl SidebarService {
         let (team_by_id, independents) = aggregate_teams(convs, teams.clone());
         let target = GroupKey::Project(project_id.to_owned());
 
-        let mut team_ids: Vec<String> = Vec::new();
-        for team in &teams {
-            // Skip teams that dropped out of the aggregate (none currently, but
-            // keeps parity with `classify`'s guard).
+        let mut member_teams: Vec<SidebarTeamThin> = Vec::new();
+        for team in teams {
+            // Skip teams that dropped out of the aggregate (parity with `classify`).
             if !team_by_id.contains_key(&team.id) {
                 continue;
             }
@@ -255,12 +240,12 @@ impl SidebarService {
                 &std_canon,
             );
             if key == target {
-                team_ids.push(team.id.clone());
+                member_teams.push(team);
             }
         }
 
-        let mut conv_ids: Vec<String> = Vec::new();
-        for conv in &independents {
+        let mut member_convs: Vec<SidebarConversationThin> = Vec::new();
+        for conv in independents {
             let key = self.classify_unit(
                 conv.project_id.as_deref(),
                 conv.workspace.as_deref(),
@@ -268,9 +253,42 @@ impl SidebarService {
                 &std_canon,
             );
             if key == target {
-                conv_ids.push(conv.id.clone());
+                member_convs.push(conv);
             }
         }
+
+        Ok((member_teams, member_convs))
+    }
+
+    /// Remove a standard project: delete every unit that renders into its group,
+    /// then the project record itself. When `dry_run` is set, nothing is deleted
+    /// and the returned counts are the preview (what *would* be removed).
+    ///
+    /// The delete set is [`collect_project_units`](Self::collect_project_units)
+    /// over the active slice, so "所见即所删" holds (incl. path-merged unbound
+    /// items). Team-member conversations are removed by the team cascade.
+    ///
+    /// # Atomicity
+    /// Deletion is **best-effort per entity**, mirroring the standalone team
+    /// delete: killing agent processes, dropping filesystem dirs, and running
+    /// cross-service delete hooks cannot share one DB transaction, so D13's
+    /// "单事务原子 + 中途失败全回滚" is not literally achievable. A failed unit is
+    /// logged and skipped; the project record is dropped last, so a mid-way
+    /// failure leaves a smaller (self-consistent) project rather than orphaning
+    /// its contents.
+    pub async fn remove_project(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        dry_run: bool,
+    ) -> Result<RemoveProjectResult, SidebarError> {
+        // Project removal operates on the active universe; archived rows are not
+        // enumerated here (their deletion is the archive page's own batch path).
+        let (member_teams, member_convs) = self
+            .collect_project_units(user_id, project_id, ArchiveScope::Active)
+            .await?;
+        let team_ids: Vec<String> = member_teams.iter().map(|t| t.id.clone()).collect();
+        let conv_ids: Vec<String> = member_convs.iter().map(|c| c.id.clone()).collect();
 
         if dry_run {
             // Name the delete set so the confirm dialog can list *which* items go.
@@ -283,7 +301,8 @@ impl SidebarService {
                 .map(|r| (r.item_type.as_str().to_owned(), r.item_id.clone()))
                 .collect();
 
-            let team_name: HashMap<&str, &str> = teams.iter().map(|t| (t.id.as_str(), t.name.as_str())).collect();
+            let team_name: HashMap<&str, &str> =
+                member_teams.iter().map(|t| (t.id.as_str(), t.name.as_str())).collect();
             let conv_resp = self.hydrate(user_id, &conv_ids, ArchiveScope::Active).await?;
 
             let mut items: Vec<RemoveProjectItem> = Vec::with_capacity(team_ids.len() + conv_ids.len());
@@ -351,6 +370,143 @@ impl SidebarService {
             teams_deleted,
             conversations_deleted,
             items: Vec::new(),
+        })
+    }
+
+    /// Archive an entire standard project in one request: archive every unit that
+    /// renders into its group (teams cascade to members) and unpin each (D6).
+    /// Membership is [`collect_project_units`](Self::collect_project_units) over
+    /// the active slice, so path-merged unbound conversations are archived too.
+    /// Best-effort per unit; a vanished / failed unit is logged and skipped.
+    /// Non-standard / foreign project → `ScopeGone`.
+    pub async fn archive_project(&self, user_id: &str, project_id: &str) -> Result<(), SidebarError> {
+        let (teams, convs) = self
+            .collect_project_units(user_id, project_id, ArchiveScope::Active)
+            .await?;
+        let now = now_ms();
+
+        for team in &teams {
+            match self.sidebar.set_team_archived(user_id, &team.id, Some(now)).await {
+                Ok(true) => {
+                    if let Err(err) = self.unpin_item(user_id, OrderItemType::Team, &team.id).await {
+                        tracing::warn!(team_id = %team.id, error = %err, "archive_project: team unpin failed")
+                    }
+                }
+                Ok(false) => tracing::warn!(team_id = %team.id, "archive_project: team vanished before archive"),
+                Err(err) => tracing::warn!(team_id = %team.id, error = %err, "archive_project: team archive failed"),
+            }
+        }
+
+        for conv in &convs {
+            match self
+                .sidebar
+                .set_conversation_archived(user_id, &conv.id, Some(now))
+                .await
+            {
+                Ok(true) => {
+                    if let Err(err) = self.unpin_item(user_id, OrderItemType::Conversation, &conv.id).await {
+                        tracing::warn!(conversation_id = %conv.id, error = %err, "archive_project: conversation unpin failed")
+                    }
+                }
+                Ok(false) => {
+                    tracing::warn!(conversation_id = %conv.id, "archive_project: conversation vanished before archive")
+                }
+                Err(err) => {
+                    tracing::warn!(conversation_id = %conv.id, error = %err, "archive_project: conversation archive failed")
+                }
+            }
+        }
+
+        tracing::info!(
+            project_id = %project_id,
+            teams = teams.len(),
+            conversations = convs.len(),
+            "Project archived (best-effort)"
+        );
+        Ok(())
+    }
+
+    /// Restore an entire archived project in one request: unarchive every unit
+    /// that renders into its group within the archived slice (teams cascade to
+    /// members). Best-effort per unit. Non-standard / foreign project →
+    /// `ScopeGone`. No re-pin (D6 dropped the pinned rows at archive time).
+    pub async fn unarchive_project(&self, user_id: &str, project_id: &str) -> Result<(), SidebarError> {
+        let (teams, convs) = self
+            .collect_project_units(user_id, project_id, ArchiveScope::Archived)
+            .await?;
+
+        for team in &teams {
+            if let Err(err) = self.sidebar.set_team_archived(user_id, &team.id, None).await {
+                tracing::warn!(team_id = %team.id, error = %err, "unarchive_project: team unarchive failed")
+            }
+        }
+        for conv in &convs {
+            if let Err(err) = self.sidebar.set_conversation_archived(user_id, &conv.id, None).await {
+                tracing::warn!(conversation_id = %conv.id, error = %err, "unarchive_project: conversation unarchive failed")
+            }
+        }
+
+        tracing::info!(
+            project_id = %project_id,
+            teams = teams.len(),
+            conversations = convs.len(),
+            "Project unarchived (best-effort)"
+        );
+        Ok(())
+    }
+
+    /// Hard-delete every **archived** unit of a standard project — the units the
+    /// archive page renders under that project. Membership is
+    /// [`collect_project_units`](Self::collect_project_units) over the archived
+    /// slice; teams cascade to their members. Best-effort per entity (same
+    /// rationale as [`delete_all_archived`](Self::delete_all_archived)).
+    ///
+    /// The project **record is intentionally never deleted** — the project stays
+    /// (possibly empty) so future work re-binds to it. Non-standard / foreign
+    /// project → `ScopeGone`.
+    pub async fn delete_archived_project(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<ArchiveDeleteResult, SidebarError> {
+        let (teams, convs) = self
+            .collect_project_units(user_id, project_id, ArchiveScope::Archived)
+            .await?;
+
+        let ports = self
+            .remove_project_ports
+            .get()
+            .ok_or_else(|| SidebarError::Internal("remove_project ports not wired".into()))?;
+
+        let mut teams_deleted = 0i64;
+        for team in &teams {
+            match ports.remove_team(user_id, &team.id).await {
+                Ok(()) => teams_deleted += 1,
+                Err(err) => {
+                    tracing::warn!(team_id = %team.id, error = %err, "delete_archived_project: team delete failed")
+                }
+            }
+        }
+
+        let mut conversations_deleted = 0i64;
+        for conv in &convs {
+            match ports.delete_conversation(user_id, &conv.id).await {
+                Ok(()) => conversations_deleted += 1,
+                Err(err) => {
+                    tracing::warn!(conversation_id = %conv.id, error = %err, "delete_archived_project: conversation delete failed")
+                }
+            }
+        }
+
+        tracing::info!(
+            project_id = %project_id,
+            teams_deleted,
+            conversations_deleted,
+            "Archived project emptied (best-effort, project record kept)"
+        );
+        Ok(ArchiveDeleteResult {
+            teams_deleted,
+            conversations_deleted,
         })
     }
 

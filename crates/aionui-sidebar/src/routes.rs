@@ -51,6 +51,12 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
             put(put_order).delete(delete_order),
         )
         .route("/api/sidebar/project/{project_id}", delete(delete_project))
+        .route("/api/sidebar/project/{project_id}/archive", post(archive_project))
+        .route("/api/sidebar/project/{project_id}/unarchive", post(unarchive_project))
+        .route(
+            "/api/sidebar/archived/project/{project_id}",
+            delete(delete_archived_project),
+        )
         .route("/api/sidebar/conversation/{id}/archive", post(archive_conversation))
         .route("/api/sidebar/conversation/{id}/unarchive", post(unarchive_conversation))
         .route("/api/sidebar/team/{id}/archive", post(archive_team))
@@ -172,6 +178,53 @@ async fn delete_project(
     let result = state
         .service
         .remove_project(&user.id, &project_id, dry_run)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+/// `POST /api/sidebar/project/{project_id}/archive` — archive the whole project
+/// group (teams cascade to members; unbound path-merged conversations included)
+/// in one request, unpinning each (D6). Non-standard / foreign id → 404.
+async fn archive_project(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .archive_project(&user.id, &project_id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `POST /api/sidebar/project/{project_id}/unarchive` — restore the whole project
+/// group from the archived slice in one request. Non-standard / foreign id → 404.
+async fn unarchive_project(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .unarchive_project(&user.id, &project_id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `DELETE /api/sidebar/archived/project/{project_id}` — hard-delete every
+/// archived unit of a project (teams cascade). The project record is kept. Reports
+/// the counts removed. Non-standard / foreign id → 404.
+async fn delete_archived_project(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<ArchiveDeleteResult>>, ApiError> {
+    let result = state
+        .service
+        .delete_archived_project(&user.id, &project_id)
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(result)))
