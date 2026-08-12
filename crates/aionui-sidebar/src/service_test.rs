@@ -1289,3 +1289,117 @@ async fn delete_all_archived_is_best_effort_on_port_failure() {
     assert!(conv_exists(pool, "a").await, "failed delete left a in place");
     assert!(!conv_exists(pool, "b").await, "sibling delete still ran");
 }
+
+/// `delete_archived_conversation` hard-deletes one independent archived
+/// conversation and leaves every other archived and active row in place.
+#[tokio::test]
+async fn delete_archived_conversation_removes_only_the_target() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "gone", None, "{}", 100).await;
+    insert_conv(pool, USER, "other", None, "{}", 90).await;
+    fx.service.archive_conversation(USER, "gone").await.unwrap();
+    fx.service.archive_conversation(USER, "other").await.unwrap();
+    insert_conv(pool, USER, "keep", None, "{}", 80).await; // active
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    fx.service.delete_archived_conversation(USER, "gone").await.unwrap();
+
+    assert!(!conv_exists(pool, "gone").await, "target archived conv deleted");
+    assert!(conv_exists(pool, "other").await, "sibling archived conv untouched");
+    assert!(conv_exists(pool, "keep").await, "active conv untouched");
+}
+
+/// Deleting an **active** (non-archived) conversation through the archive
+/// endpoint is `ScopeGone` (404) and deletes nothing — the endpoint can never
+/// reach into the active slice.
+#[tokio::test]
+async fn delete_archived_conversation_rejects_active_id() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "active", None, "{}", 100).await; // never archived
+    insert_conv(pool, OTHER, "foreign", None, "{}", 90).await;
+    fx.service.archive_conversation(OTHER, "foreign").await.unwrap(); // archived, other user
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let err = fx
+        .service
+        .delete_archived_conversation(USER, "active")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "active id → 404");
+    let err = fx
+        .service
+        .delete_archived_conversation(USER, "foreign")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "foreign archived id → 404");
+    let err = fx
+        .service
+        .delete_archived_conversation(USER, "no-such")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "unknown id → 404");
+
+    assert!(conv_exists(pool, "active").await, "active conv untouched");
+    assert!(conv_exists(pool, "foreign").await, "foreign conv untouched");
+}
+
+/// A team **member** conversation is not an independent row; deleting it through
+/// the single-conversation endpoint is `ScopeGone` (it folds into its team and
+/// leaves via [`delete_archived_team`]), so a live team cannot be split.
+#[tokio::test]
+async fn delete_archived_conversation_rejects_team_member() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_team(pool, USER, "T1", "", None, 100).await;
+    insert_member(pool, USER, "m1", "T1", 90).await;
+    fx.service.archive_team(USER, "T1").await.unwrap();
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    let err = fx.service.delete_archived_conversation(USER, "m1").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "member id → 404");
+    assert!(conv_exists(pool, "m1").await, "member conv untouched");
+}
+
+/// `delete_archived_team` hard-deletes one archived team and cascades its
+/// members; an unknown / foreign team id is `ScopeGone`.
+#[tokio::test]
+async fn delete_archived_team_cascades_and_gates_foreign() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_team(pool, USER, "T1", "", None, 100).await;
+    insert_member(pool, USER, "m1", "T1", 90).await;
+    fx.service.archive_team(USER, "T1").await.unwrap();
+    insert_team(pool, OTHER, "TF", "", None, 80).await;
+    fx.service.archive_team(OTHER, "TF").await.unwrap();
+
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    // Foreign / unknown team → 404, nothing removed.
+    let err = fx.service.delete_archived_team(USER, "TF").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "foreign team → 404");
+    let err = fx.service.delete_archived_team(USER, "no-such").await.unwrap_err();
+    assert!(matches!(err, SidebarError::ScopeGone), "unknown team → 404");
+
+    // Own archived team deletes and cascades its member.
+    fx.service.delete_archived_team(USER, "T1").await.unwrap();
+    assert!(!conv_exists(pool, "m1").await, "member cascaded out");
+    let team_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = 'T1'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(team_left, 0, "archived team deleted");
+    let foreign_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE id = 'TF'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_left, 1, "foreign team untouched");
+}

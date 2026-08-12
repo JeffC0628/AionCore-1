@@ -414,6 +414,56 @@ impl SidebarService {
         })
     }
 
+    // -- Delete one archived unit (single hard-delete) -----------------------
+
+    /// Hard-delete a single archived **independent** conversation — the same
+    /// unit the archive page renders as its own row. The id is validated against
+    /// the archived independents slice (members fold into their team and are
+    /// removed via [`delete_archived_team`]); a missing, active, foreign, or
+    /// team-member id is [`SidebarError::ScopeGone`], so this path can never
+    /// reach an active conversation or split a live team.
+    pub async fn delete_archived_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let convs = self
+            .sidebar
+            .list_conversations_thin(user_id, ArchiveScope::Archived)
+            .await?;
+        let teams = self.sidebar.list_teams_thin(user_id, ArchiveScope::Archived).await?;
+        let (_team_by_id, independents) = aggregate_teams(convs, teams);
+        if !independents.iter().any(|c| c.id == id) {
+            return Err(SidebarError::ScopeGone);
+        }
+
+        let ports = self
+            .remove_project_ports
+            .get()
+            .ok_or_else(|| SidebarError::Internal("remove_project ports not wired".into()))?;
+        ports
+            .delete_conversation(user_id, id)
+            .await
+            .map_err(SidebarError::Internal)?;
+        tracing::info!(conversation_id = %id, "Archived conversation deleted");
+        Ok(())
+    }
+
+    /// Hard-delete a single archived team; its member conversations cascade with
+    /// it, mirroring [`delete_all_archived`]. The id is validated against the
+    /// archived teams slice — a missing, active, or foreign id is
+    /// [`SidebarError::ScopeGone`].
+    pub async fn delete_archived_team(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let teams = self.sidebar.list_teams_thin(user_id, ArchiveScope::Archived).await?;
+        if !teams.iter().any(|t| t.id == id) {
+            return Err(SidebarError::ScopeGone);
+        }
+
+        let ports = self
+            .remove_project_ports
+            .get()
+            .ok_or_else(|| SidebarError::Internal("remove_project ports not wired".into()))?;
+        ports.remove_team(user_id, id).await.map_err(SidebarError::Internal)?;
+        tracing::info!(team_id = %id, "Archived team deleted");
+        Ok(())
+    }
+
     // -- Read side (first screen / paging) -----------------------------------
 
     /// First screen: `pinned → project-area (project + dir interleaved) → chats`.

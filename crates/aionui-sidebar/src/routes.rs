@@ -56,6 +56,11 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
         .route("/api/sidebar/team/{id}/archive", post(archive_team))
         .route("/api/sidebar/team/{id}/unarchive", post(unarchive_team))
         .route("/api/sidebar/archived", delete(delete_archived))
+        .route(
+            "/api/sidebar/archived/conversation/{id}",
+            delete(delete_archived_conversation),
+        )
+        .route("/api/sidebar/archived/team/{id}", delete(delete_archived_team))
         .with_state(state)
 }
 
@@ -184,6 +189,36 @@ async fn delete_archived(
         .await
         .map_err(to_api_error)?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+/// `DELETE /api/sidebar/archived/conversation/{id}` — permanently delete a single
+/// archived independent conversation. Non-archived / foreign / member id → 404.
+async fn delete_archived_conversation(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .delete_archived_conversation(&user.id, &id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+/// `DELETE /api/sidebar/archived/team/{id}` — permanently delete a single archived
+/// team (members cascade). Non-archived / foreign id → 404.
+async fn delete_archived_team(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .delete_archived_team(&user.id, &id)
+        .await
+        .map_err(to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
 }
 
 /// `POST /api/sidebar/conversation/{id}/archive` — move a conversation into the
