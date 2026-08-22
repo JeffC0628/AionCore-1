@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.72](https://github.com/iOfficeAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-22)
+
+
+### Features
+
+* **conversation:** persist plan snapshots and expose them for rehydration ([#916](https://github.com/iOfficeAI/AionCore/issues/916)) ([b2f12e9](https://github.com/iOfficeAI/AionCore/commit/b2f12e952ec8e71ed37f6240108998c9d7b016a1))
+
+
+### Bug Fixes
+
+* **auth:** extend JWT TTL to 30d to match cookie ([#918](https://github.com/iOfficeAI/AionCore/issues/918)) ([ecbedfa](https://github.com/iOfficeAI/AionCore/commit/ecbedfa622e80b7141cf1f0ab7dd007b23d1714d))
+
 ## [0.1.71](https://github.com/iOfficeAI/AionCore/compare/v0.1.70...v0.1.71) (2026-08-21)
 
 
